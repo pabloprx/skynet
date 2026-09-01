@@ -40,9 +40,14 @@ export async function clone(target: string) {
 export function detectTestCmd(dir: string): string | null {
   const has = (f: string) => existsSync(join(dir, f));
   if (has("package.json")) {
-    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-    if (pkg.scripts?.test) return has("bun.lock") || has("bun.lockb") ? "bun install && bun run test" : "npm install --silent && npm test";
-    return "bun test";
+    let pkg: any;
+    try {
+      pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+    } catch {
+      pkg = null; // malformed/unparseable package.json: fall through to the other detectors
+    }
+    if (pkg?.scripts?.test) return has("bun.lock") || has("bun.lockb") ? "bun install && bun run test" : "npm install --silent && npm test";
+    if (pkg) return "bun test";
   }
   if (has("pyproject.toml") || has("pytest.ini") || has("setup.py")) return "python -m pytest -q";
   if (has("Cargo.toml")) return "cargo test";
@@ -256,6 +261,10 @@ async function selftest() {
   const globDir = join(HOME, "selftest-glob"); mkdirSync(globDir, { recursive: true });
   await Bun.write(join(globDir, "add.test.ts"), "");
   assert(detectTestCmd(globDir) === "bun test", "detect glob test file, no package.json");
+  const badPkgDir = join(HOME, "selftest-badpkg"); mkdirSync(badPkgDir, { recursive: true });
+  await Bun.write(join(badPkgDir, "package.json"), "{not json!!");
+  await Bun.write(join(badPkgDir, "add.test.ts"), "");
+  assert(detectTestCmd(badPkgDir) === "bun test", "detect bun test with malformed package.json");
   assert((await sh("exit 3", tmp)).code === 3, "sh exit code");
   assert((await sh("echo hi", tmp)).text.trim() === "hi", "sh output");
   const local = await clone(tmp); assert(local === resolve(tmp), "clone local path passthrough");
