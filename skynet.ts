@@ -17,6 +17,9 @@ const MEMORY = join(HOME, "memory.md");
 const WORK = join(HOME, "work");
 const MODEL = process.env.SKYNET_MODEL ?? "z-ai/glm-5.3-flash";
 export const VERSION = "0.1.0";
+// every place skynet spawns another skynet.ts process passes SKYNET_DEPTH=DEPTH+1; startup refuses
+// once it exceeds 2, so a recursion bug in gate()/agentLoop/evolve can no longer fork-bomb the box.
+const DEPTH = Number(process.env.SKYNET_DEPTH ?? "0");
 
 // ---------- shell ----------
 // cancellable delay: a bare Bun.sleep can't be cancelled, and a still-pending one keeps bun's event
@@ -164,7 +167,7 @@ export async function agentLoop(
 ) {
   if (process.env.SKYNET_PROVIDER === "claude") {
     const prompt = `${system}\n\n${user}`;
-    const p = Bun.spawn(["claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "--max-turns", String(maxTurns)], { cwd: dir, stdout: "pipe", stderr: "pipe", env: { ...process.env, ...childEnv, SKYNET_CHILD: "1" } });
+    const p = Bun.spawn(["claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "--max-turns", String(maxTurns)], { cwd: dir, stdout: "pipe", stderr: "pipe", env: { ...process.env, ...childEnv, SKYNET_CHILD: "1", SKYNET_DEPTH: String(DEPTH + 1) } });
     p.unref();
     const read = async (stream: ReadableStream<Uint8Array>) => new Response(stream).text();
     const output = Promise.all([read(p.stdout), read(p.stderr), p.exited]);
@@ -355,12 +358,12 @@ export async function gate(child: string, n: number, goal: string): Promise<{ ok
   const tsc = await sh("bunx tsc --noEmit", child, 120_000);
   if (tsc.code !== 0) return { ok: false, reason: `tsc failed: ${tsc.text.slice(-500)}` };
 
-  const st = await sh(`SKYNET_HOME=${JSON.stringify(join(tmpdir(), `skynet-gate-selftest-${n}-${Date.now()}`))} bun skynet.ts --selftest`, child, 60_000);
+  const st = await sh(`SKYNET_HOME=${JSON.stringify(join(tmpdir(), `skynet-gate-selftest-${n}-${Date.now()}`))} SKYNET_DEPTH=${DEPTH + 1} bun skynet.ts --selftest`, child, 60_000);
   if (st.code !== 0) return { ok: false, reason: `selftest failed: ${st.text.slice(-500)}` };
 
   // parent copies its own smoke test over whatever the child left, so the child can't weaken it
   await Bun.write(join(child, "smoke.test.ts"), readFileSync(join(import.meta.dir, "smoke.test.ts")));
-  const smoke = await sh(`SKYNET_HOME=${JSON.stringify(join(tmpdir(), `skynet-gate-smoke-${n}-${Date.now()}`))} bun test smoke.test.ts`, child, 120_000);
+  const smoke = await sh(`SKYNET_HOME=${JSON.stringify(join(tmpdir(), `skynet-gate-smoke-${n}-${Date.now()}`))} SKYNET_DEPTH=${DEPTH + 1} bun test smoke.test.ts`, child, 120_000);
   if (smoke.code !== 0) return { ok: false, reason: `smoke test failed: ${smoke.text.slice(-500)}` };
 
   const review = await diffReview(child, goal);
@@ -435,7 +438,7 @@ Constraints: only edit files inside this directory, never touch .env, keep "bun 
 Never touch these files: ${ALWAYS_PROTECTED_FILES.join(", ")} — any change to them causes automatic rejection. package.json and bun.lock are also rejected unless this goal explicitly asks for a dependency change.
 Never run "bun skynet.ts evolve" or "bun skynet.ts <target>" — this is a self-modification task, not an evolve/repair run; that is blocked and will fail.
 When done, reply with exactly one line starting with "LESSON:".`;
-  const { lesson, totalCost, budgetExceeded } = await agentLoop(child, system, "Make the change now.", maxTurns, budget, { SKYNET_CHILD: "1" });
+  const { lesson, totalCost, budgetExceeded } = await agentLoop(child, system, "Make the change now.", maxTurns, budget, { SKYNET_CHILD: "1", SKYNET_DEPTH: String(DEPTH + 1) });
   console.log(`gen ${n} total cost: $${totalCost.toFixed(6)}`);
 
   const gateResult = budgetExceeded
@@ -459,7 +462,7 @@ When done, reply with exactly one line starting with "LESSON:".`;
   if (remaining > 0) {
     const argv = ["evolve", "--generations", String(remaining), "--max-turns", String(maxTurns), "--budget", String(budget)];
     if (goalArg) argv.push("--goal", goalArg);
-    const p = Bun.spawn(["bun", join(ROOT, "skynet.ts"), ...argv], { cwd: ROOT, stdio: ["inherit", "inherit", "inherit"] });
+    const p = Bun.spawn(["bun", join(ROOT, "skynet.ts"), ...argv], { cwd: ROOT, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env, SKYNET_DEPTH: String(DEPTH + 1) } });
     process.exit(await p.exited);
   }
 }
@@ -622,48 +625,48 @@ async function selftest() {
     assert((await resolveGoal(goalFile)) === "goal from file", "resolveGoal reads a file");
   }
 
+  // only at the top level: gate() itself calls `bun skynet.ts --selftest` on its child (one level
+  // of recursion, always has), and that nested selftest run would hit this same block again if it
+  // weren't gated on DEPTH - bounding it to one level, not a recursion that grows with DEPTH.
+  if (DEPTH === 0) {
+    // gate: offline test against throwaway clones under tmpdir, calling gate() directly - never
+    // spawns `skynet.ts adopt/evolve/run` from inside selftest. That used to recurse unboundedly
+    // (selftest -> adopt -> gate -> selftest -> adopt -> ...); SKYNET_DEPTH now also caps gate()'s
+    // own nested selftest/smoke spawns below, but this test no longer relies on that cap to halt.
+    // copy the actual working tree (not `git clone`, which would only see committed history and
+    // miss whatever fix is being tested right now), then commit it as the child's base so the
+    // harmless/bad edits below show up as gate()'s uncommitted diff, same shape a real evolve/adopt leaves.
+    const seedChild = async (dir: string) => {
+      mkdirSync(dir, { recursive: true });
+      assert((await sh(`(cd ${JSON.stringify(import.meta.dir)} && tar cf - --exclude=.git --exclude=node_modules .) | tar xf -`, dir, 60_000)).code === 0, "gate: seed child working tree");
+      assert((await sh(`git init -q && git add -A && git commit -qm "chore: base"`, dir)).code === 0, "gate: commit child base");
+    };
+
+    const gchild = join(scratch, "gate-child-ok");
+    await seedChild(gchild);
+    assert((await sh(`ln -s ${JSON.stringify(join(import.meta.dir, "node_modules"))} ${JSON.stringify(join(gchild, "node_modules"))}`, scratch)).code === 0, "gate: link node_modules");
+    await sh(`echo '// gate-selftest: harmless' >> skynet.ts`, gchild);
+    const okResult = await gate(gchild, 999_001, "harmless comment");
+    assert(okResult.ok, `gate: harmless diff should pass: ${okResult.reason}`);
+
+    const bchild = join(scratch, "gate-child-bad");
+    await seedChild(bchild);
+    await sh(`echo '// gate-selftest: bad' >> smoke.test.ts`, bchild);
+    const badResult = await gate(bchild, 999_002, "harmless comment");
+    assert(!badResult.ok && badResult.reason.includes("touched disallowed files"), `gate: touching smoke.test.ts should reject: ${badResult.reason}`);
+  }
+
   {
-    // adopt: real integration test against throwaway git repos under tmpdir. adopt() uses
-    // import.meta.dir as ROOT, so it must run as a subprocess whose skynet.ts lives in a clone -
-    // never against the real project.
-    const bare = join(scratch, "adopt-bare.git");
-    assert((await sh(`git clone --bare ${JSON.stringify(import.meta.dir)} ${JSON.stringify(bare)}`, scratch, 60_000)).code === 0, "adopt: bare clone of ROOT");
-
-    const work = join(scratch, "adopt-work");
-    assert((await sh(`git clone ${JSON.stringify(bare)} ${JSON.stringify(work)}`, scratch, 60_000)).code === 0, "adopt: work clone of bare");
-    assert((await sh(`git checkout -b harmless`, work)).code === 0, "adopt: branch harmless");
-    await sh(`echo '// adopt-selftest: harmless' >> skynet.ts`, work);
-    assert((await sh(`git commit -am "chore: harmless comment"`, work)).code === 0, "adopt: harmless commit");
-    assert((await sh(`git push origin harmless`, work)).code === 0, "adopt: push harmless branch");
-
-    assert((await sh(`git checkout main && git checkout -b breaks-smoke`, work)).code === 0, "adopt: branch breaks-smoke");
-    await sh(`echo '// adopt-selftest: bad' >> smoke.test.ts`, work);
-    assert((await sh(`git commit -am "chore: touch smoke test"`, work)).code === 0, "adopt: breaks-smoke commit");
-    assert((await sh(`git push origin breaks-smoke`, work)).code === 0, "adopt: push breaks-smoke branch");
-
-    const tempRoot = join(scratch, "adopt-root");
-    assert((await sh(`git clone ${JSON.stringify(import.meta.dir)} ${JSON.stringify(tempRoot)}`, scratch, 60_000)).code === 0, "adopt: temp root clone");
-    assert((await sh(`ln -s ${JSON.stringify(join(import.meta.dir, "node_modules"))} ${JSON.stringify(join(tempRoot, "node_modules"))}`, scratch)).code === 0, "adopt: link node_modules");
-
-    const okRun = await sh(
-      `SKYNET_HOME=${JSON.stringify(join(scratch, "adopt-home-ok"))} bun ${JSON.stringify(join(tempRoot, "skynet.ts"))} adopt ${JSON.stringify(bare)} --ref harmless`,
-      tempRoot, 300_000,
-    );
-    assert(okRun.code === 0, `adopt promote run: ${okRun.text}`);
-    assert(readFileSync(join(tempRoot, "skynet.ts"), "utf8").includes("adopt-selftest: harmless"), "adopt: harmless change promoted into root");
-
-    const badRun = await sh(
-      `SKYNET_HOME=${JSON.stringify(join(scratch, "adopt-home-reject"))} bun ${JSON.stringify(join(tempRoot, "skynet.ts"))} adopt ${JSON.stringify(bare)} --ref breaks-smoke`,
-      tempRoot, 300_000,
-    );
-    assert(badRun.code === 0, `adopt reject run should still exit 0: ${badRun.text}`);
-    assert(badRun.text.includes("touched disallowed files"), `adopt: rejected for touching smoke.test.ts: ${badRun.text}`);
+    // SKYNET_DEPTH guard: a spawn past depth 2 must refuse before doing any work.
+    const r = await sh("SKYNET_DEPTH=3 bun skynet.ts --version", import.meta.dir, 20_000);
+    assert(r.code !== 0 && r.text.includes("nesting depth exceeded"), "SKYNET_DEPTH>2 refuses to run");
   }
 
   console.log("selftest ok");
 }
 
 if (import.meta.main) {
+  if (DEPTH > 2) { console.error("skynet: nesting depth exceeded"); process.exit(1); }
   const args = process.argv.slice(2);
   if (args[0] === "--version") console.log(VERSION);
   else if (args[0] === "--selftest") await selftest();

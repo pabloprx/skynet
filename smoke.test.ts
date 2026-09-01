@@ -84,6 +84,6 @@ test("cli: --version exits 0", async () => {
 
 test("cli: --selftest exits 0", async () => {
   const home = join(TMP, "selftest-home");
-  const r = await sh(`SKYNET_HOME=${JSON.stringify(home)} bun skynet.ts --selftest`, ".", 120_000);
+  const r = await sh(`SKYNET_HOME=${JSON.stringify(home)} bun skynet.ts --selftest`, ".", 20_000);
   expect(r.code).toBe(0);
-}, 120_000); // selftest now runs a real adopt integration test (git clones + bun install), well over bun:test's 5s default
+}, 20_000); // selftest clones + bun installs a throwaway repo for the gate() test, over bun:test's 5s default
