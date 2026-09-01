@@ -365,8 +365,13 @@ if (import.meta.main) {
   if (args[0] === "--version") console.log(VERSION);
   else if (args[0] === "--selftest") await selftest();
   else if (args[0] === "evolve") {
-    const { generations, goal, maxTurns } = parseEvolveFlags(args.slice(1));
-    await evolve(generations, goal, maxTurns).catch((e) => { console.error(e.message); process.exit(1); });
+    try {
+      const { generations, goal, maxTurns } = parseEvolveFlags(args.slice(1));
+      await evolve(generations, goal, maxTurns);
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
   } else if (!args[0]) {
     console.error("usage: bun skynet.ts <git-url|path> [--max-turns N] | evolve [--generations N] [--goal text] [--max-turns N] | --selftest | --version");
     process.exit(1);
