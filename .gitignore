@@ -27,6 +27,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .cache
 *.tsbuildinfo
 
+# stray SKYNET_HOME scratch dirs from ad-hoc runs (should never land here, belt and braces)
+.tmp/
+
 # IntelliJ based IDEs
 .idea
 
