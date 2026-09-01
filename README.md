@@ -27,16 +27,30 @@ the fix and appends a lesson to memory. `--max-turns` (default 25) caps the
 repair loop.
 
 ```
-bun skynet.ts evolve [--generations N] [--goal "text"] [--max-turns N] [--budget usd]
+bun skynet.ts evolve [--generations N] [--goal "text|url|path"] [--max-turns N] [--budget usd]
 ```
 Self-modification: clone skynet's own repo into `~/.skynet/gen/N`, let the
 LLM edit it toward a goal (auto-picked if `--goal` is omitted), then run it
 through the gate (see below). If the gate passes, fast-forward the change
 into the parent repo and re-exec for the next generation.
 - `--generations` (default 3): how many generations to run in sequence.
-- `--goal`: skip auto-goal-picking and use this text instead.
+- `--goal`: skip auto-goal-picking and use this instead. A literal string, or
+  a source to read it from: an `http(s)://` URL (fetched) or an existing
+  local file path (read). See [Sharing](#sharing).
 - `--max-turns` (default 15): tool-loop turn cap per generation.
 - `--budget` (default 0.05): USD spend cap per generation; exceeding it fails the gate.
+
+```
+bun skynet.ts adopt <git-url> [--ref ref] [--budget usd]
+```
+Pull another skynet's code through the same gate, instead of an LLM
+generating the diff. Clones skynet's own repo into `~/.skynet/gen/N` (same as
+`evolve`), merges `ref` (default `main`) from `git-url` into it, and runs the
+result through the unchanged gate. A merge conflict is rejected outright. No
+LLM call, so cost is $0 unless `SKYNET_REVIEW_MODEL` is set. See
+[Sharing](#sharing).
+- `--ref` (default `main`): branch/ref to pull from `git-url`.
+- `--budget` (default 0.05): accepted for parity with `evolve`; unused since `adopt` makes no LLM call.
 
 ```
 bun skynet.ts revert
@@ -82,6 +96,21 @@ Prints the version string.
 A running `evolve` refuses to run recursively (checked via `SKYNET_CHILD`,
 which is set only inside a gated child process), so an evolving generation
 can't itself spawn another evolve or repair run.
+
+## Sharing
+
+Two ways to spread a change between skynet instances, both through the same
+gate:
+
+- **Goal from a URL or file.** `--goal` (on `evolve`) doesn't have to be
+  literal text: point it at an `http(s)://` URL and skynet fetches the body,
+  or an existing local file path and it reads the file. Publish a `GOAL.md`
+  in a repo or gist describing an improvement, and anyone can run
+  `bun skynet.ts evolve --goal https://.../GOAL.md` to have their own LLM
+  re-derive the change against their own source, gated as normal.
+- **`adopt`.** Pull another skynet's actual commit and let the gate judge the
+  diff directly, no LLM involved:
+  `bun skynet.ts adopt https://github.com/example/skynet --ref some-branch`.
 
 ## Environment variables
 

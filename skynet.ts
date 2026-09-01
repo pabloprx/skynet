@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 // skynet: clone a repo, run its tests, let an LLM repair failures, remember what it learned.
 //   bun skynet.ts <git-url|path> [--max-turns N]
-//   bun skynet.ts evolve [--generations N] [--goal "text"] [--max-turns N] [--budget usd]
+//   bun skynet.ts evolve [--generations N] [--goal "text|url|path"] [--max-turns N] [--budget usd]
+//   bun skynet.ts adopt <git-url> [--ref ref] [--budget usd]
 //   bun skynet.ts revert
 //   bun skynet.ts --selftest
 //   bun skynet.ts --version
@@ -89,6 +90,19 @@ export function detectTestCmd(dir: string): string | null {
   const glob = new Bun.Glob("**/*{.test.ts,.test.js,_test.ts,_test.js}");
   for (const _ of glob.scanSync({ cwd: dir })) return "bun test";
   return null;
+}
+
+// ---------- goal sources ----------
+// a goal can be literal text, a path to a local file, or an http(s) URL (e.g. a GOAL.md a repo
+// or gist publishes) so any skynet can re-derive a published change against its own source.
+export async function resolveGoal(value: string): Promise<string> {
+  if (/^https?:\/\//i.test(value)) {
+    const res = await fetch(value);
+    if (!res.ok) throw new Error(`resolveGoal: fetch failed (${res.status}) for ${value}`);
+    return (await res.text()).trim();
+  }
+  if (existsSync(value)) return readFileSync(value, "utf8").trim();
+  return value;
 }
 
 // ---------- learn ----------
@@ -390,7 +404,7 @@ export async function evolve(generations: number, goalArg: string | undefined, m
   const inst = await sh("bun install", child, 300_000);
   if (inst.code !== 0) throw new Error(`bun install failed in ${child}: ${inst.text}`);
 
-  const goal = goalArg ?? (await pickGoal(child));
+  const goal = goalArg !== undefined ? await resolveGoal(goalArg) : await pickGoal(child);
   console.log(`gen ${n} goal: ${goal}`);
 
   const system = `You are skynet, improving your own source at ${child}. Goal: ${goal}.
@@ -424,6 +438,68 @@ When done, reply with exactly one line starting with "LESSON:".`;
     if (goalArg) argv.push("--goal", goalArg);
     const p = Bun.spawn(["bun", join(ROOT, "skynet.ts"), ...argv], { cwd: ROOT, stdio: ["inherit", "inherit", "inherit"] });
     process.exit(await p.exited);
+  }
+}
+
+// ---------- adopt: pull another skynet's code through the same gate ----------
+export function parseAdoptFlags(argv: string[]) {
+  const flags = [...argv];
+  const url = flags.shift();
+  if (!url) throw new Error("adopt requires a git-url");
+  const ri = flags.indexOf("--ref");
+  const ref = ri >= 0 ? flags.splice(ri, 2)[1]! : "main";
+  const bi = flags.indexOf("--budget");
+  const budget = bi >= 0 ? Number(flags.splice(bi, 2)[1]) : 0.05;
+  if (!Number.isFinite(budget) || budget <= 0) throw new Error(`--budget must be a positive number (got ${flags[bi]})`);
+  return { url, ref, budget };
+}
+
+// ponytail: budget is accepted for CLI parity with evolve but unused - adopt makes no LLM call
+// (cost is 0 unless SKYNET_REVIEW_MODEL is set, and gate()'s diff review isn't budget-metered
+// for evolve either). Add real metering here if a paid review model regularly runs on adopt.
+export async function adopt(url: string, ref: string, _budget: number) {
+  if (process.env.SKYNET_CHILD) throw new Error("adopt: refusing to run recursively inside a child (SKYNET_CHILD is set)");
+  const ROOT = import.meta.dir;
+  await ensureRepo(ROOT);
+  const dirty0 = await sh("git status --porcelain", ROOT);
+  if (dirty0.text.trim()) await sh(`git add -A && git commit -qm "chore: pre-evolve"`, ROOT);
+
+  const genRoot = join(HOME, "gen");
+  mkdirSync(genRoot, { recursive: true });
+  const n = nextGenDir(genRoot);
+  const child = join(genRoot, String(n));
+
+  const cl = await sh(`git clone ${JSON.stringify(ROOT)} ${JSON.stringify(child)}`, genRoot, 300_000);
+  if (cl.code !== 0) throw new Error(`self-clone failed: ${cl.text}`);
+
+  const goal = `adopt ${url}`;
+  const beforeSha = (await sh("git rev-parse HEAD", child)).text.trim();
+  const pull = await sh(`git pull --no-ff --no-edit ${JSON.stringify(url)} ${JSON.stringify(ref)}`, child, 120_000);
+
+  let gateResult: { ok: boolean; reason: string };
+  if (pull.code !== 0) {
+    await sh("git merge --abort", child);
+    gateResult = { ok: false, reason: "merge conflict" };
+  } else {
+    // git pull --no-ff commits the merge immediately, but gate()'s checks read the *uncommitted*
+    // diff (built for evolve's uncommitted-edit flow) - reset back to expose the merge as an
+    // unstaged diff, same shape gate() already expects, then re-commit once it passes below.
+    const afterSha = (await sh("git rev-parse HEAD", child)).text.trim();
+    if (afterSha !== beforeSha) await sh(`git reset ${beforeSha}`, child);
+    gateResult = await gate(child, n, goal);
+  }
+
+  if (gateResult.ok) {
+    const msgPath = join(tmpdir(), `skynet-commit-msg-${n}-${Date.now()}.txt`);
+    await Bun.write(msgPath, evolveCommitMessage(n, goal));
+    await sh(`git add -A && git commit -qF ${JSON.stringify(msgPath)}`, child);
+    const pullBack = await sh(`git pull --ff-only ${JSON.stringify(child)} HEAD`, ROOT, 60_000);
+    if (pullBack.code !== 0) throw new Error(`ff-only pull failed: ${pullBack.text}`);
+    learn("self", `gen ${n} adopted: ${goal}`);
+    console.log(`gen ${n} adopted.`);
+  } else {
+    learn("self", `gen ${n} adopt rejected: ${goal}: ${gateResult.reason}`);
+    console.log(`gen ${n} adopt rejected (${gateResult.reason}), left at ${child} for inspection.`);
   }
 }
 
@@ -505,6 +581,51 @@ async function selftest() {
 
   assert(VERSION === "0.1.0", "--version reports 0.1.0");
 
+  assert((await resolveGoal("just some text")) === "just some text", "resolveGoal literal passthrough");
+  {
+    const goalFile = join(scratch, "goal.txt");
+    await Bun.write(goalFile, "goal from file\n");
+    assert((await resolveGoal(goalFile)) === "goal from file", "resolveGoal reads a file");
+  }
+
+  {
+    // adopt: real integration test against throwaway git repos under tmpdir. adopt() uses
+    // import.meta.dir as ROOT, so it must run as a subprocess whose skynet.ts lives in a clone -
+    // never against the real project.
+    const bare = join(scratch, "adopt-bare.git");
+    assert((await sh(`git clone --bare ${JSON.stringify(import.meta.dir)} ${JSON.stringify(bare)}`, scratch, 60_000)).code === 0, "adopt: bare clone of ROOT");
+
+    const work = join(scratch, "adopt-work");
+    assert((await sh(`git clone ${JSON.stringify(bare)} ${JSON.stringify(work)}`, scratch, 60_000)).code === 0, "adopt: work clone of bare");
+    assert((await sh(`git checkout -b harmless`, work)).code === 0, "adopt: branch harmless");
+    await sh(`echo '// adopt-selftest: harmless' >> skynet.ts`, work);
+    assert((await sh(`git commit -am "chore: harmless comment"`, work)).code === 0, "adopt: harmless commit");
+    assert((await sh(`git push origin harmless`, work)).code === 0, "adopt: push harmless branch");
+
+    assert((await sh(`git checkout main && git checkout -b breaks-smoke`, work)).code === 0, "adopt: branch breaks-smoke");
+    await sh(`echo '// adopt-selftest: bad' >> smoke.test.ts`, work);
+    assert((await sh(`git commit -am "chore: touch smoke test"`, work)).code === 0, "adopt: breaks-smoke commit");
+    assert((await sh(`git push origin breaks-smoke`, work)).code === 0, "adopt: push breaks-smoke branch");
+
+    const tempRoot = join(scratch, "adopt-root");
+    assert((await sh(`git clone ${JSON.stringify(import.meta.dir)} ${JSON.stringify(tempRoot)}`, scratch, 60_000)).code === 0, "adopt: temp root clone");
+    assert((await sh(`ln -s ${JSON.stringify(join(import.meta.dir, "node_modules"))} ${JSON.stringify(join(tempRoot, "node_modules"))}`, scratch)).code === 0, "adopt: link node_modules");
+
+    const okRun = await sh(
+      `SKYNET_HOME=${JSON.stringify(join(scratch, "adopt-home-ok"))} bun ${JSON.stringify(join(tempRoot, "skynet.ts"))} adopt ${JSON.stringify(bare)} --ref harmless`,
+      tempRoot, 300_000,
+    );
+    assert(okRun.code === 0, `adopt promote run: ${okRun.text}`);
+    assert(readFileSync(join(tempRoot, "skynet.ts"), "utf8").includes("adopt-selftest: harmless"), "adopt: harmless change promoted into root");
+
+    const badRun = await sh(
+      `SKYNET_HOME=${JSON.stringify(join(scratch, "adopt-home-reject"))} bun ${JSON.stringify(join(tempRoot, "skynet.ts"))} adopt ${JSON.stringify(bare)} --ref breaks-smoke`,
+      tempRoot, 300_000,
+    );
+    assert(badRun.code === 0, `adopt reject run should still exit 0: ${badRun.text}`);
+    assert(badRun.text.includes("touched disallowed files"), `adopt: rejected for touching smoke.test.ts: ${badRun.text}`);
+  }
+
   console.log("selftest ok");
 }
 
@@ -520,6 +641,14 @@ if (import.meta.main) {
       console.error(e instanceof Error ? e.message : String(e));
       process.exit(1);
     }
+  } else if (args[0] === "adopt") {
+    try {
+      const { url, ref, budget } = parseAdoptFlags(args.slice(1));
+      await adopt(url, ref, budget);
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
   } else if (args[0] === "revert") {
     try {
       await revert();
@@ -528,7 +657,7 @@ if (import.meta.main) {
       process.exit(1);
     }
   } else if (!args[0]) {
-    console.error("usage: bun skynet.ts <git-url|path> [--max-turns N] | evolve [--generations N] [--goal text] [--max-turns N] [--budget usd] | revert | --selftest | --version");
+    console.error("usage: bun skynet.ts <git-url|path> [--max-turns N] | evolve [--generations N] [--goal text|url|path] [--max-turns N] [--budget usd] | adopt <git-url> [--ref ref] [--budget usd] | revert | --selftest | --version");
     process.exit(1);
   } else {
     try {
