@@ -208,14 +208,22 @@ export function nextGenDir(genRoot: string): number {
   return (nums.length ? Math.max(...nums) : 0) + 1;
 }
 
+export function parsePositiveIntegerFlag(flag: string, raw: string | undefined): number {
+  const value = raw === undefined ? NaN : Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${flag} must be a positive integer (got ${raw ?? "missing value"})`);
+  }
+  return value;
+}
+
 export function parseEvolveFlags(argv: string[]) {
   const flags = [...argv];
   const gi = flags.indexOf("--generations");
-  const generations = gi >= 0 ? Number(flags.splice(gi, 2)[1]) : 3;
+  const generations = gi >= 0 ? parsePositiveIntegerFlag("--generations", flags.splice(gi, 2)[1]) : 3;
   const goi = flags.indexOf("--goal");
   const goal = goi >= 0 ? flags.splice(goi, 2)[1] : undefined;
   const mti = flags.indexOf("--max-turns");
-  const maxTurns = mti >= 0 ? Number(flags.splice(mti, 2)[1]) : 15;
+  const maxTurns = mti >= 0 ? parsePositiveIntegerFlag("--max-turns", flags.splice(mti, 2)[1]) : 15;
   return { generations, goal, maxTurns };
 }
 
@@ -340,6 +348,7 @@ async function selftest() {
   assert(f1.generations === 3 && f1.goal === undefined && f1.maxTurns === 15, "parseEvolveFlags defaults");
   const f2 = parseEvolveFlags(["--generations", "5", "--goal", "x y", "--max-turns", "7"]);
   assert(f2.generations === 5 && f2.goal === "x y" && f2.maxTurns === 7, "parseEvolveFlags overrides");
+  assert(["0", "-1", "nope", "Infinity"].every((n) => { try { parsePositiveIntegerFlag("--max-turns", n); return false; } catch { return true; } }), "numeric flags reject invalid values");
 
   const pc = parseToolCmd('{"cmd":"ls"}');
   assert("cmd" in pc && pc.cmd === "ls", "parseToolCmd accepts valid cmd");
@@ -362,8 +371,13 @@ if (import.meta.main) {
     console.error("usage: bun skynet.ts <git-url|path> [--max-turns N] | evolve [--generations N] [--goal text] [--max-turns N] | --selftest | --version");
     process.exit(1);
   } else {
-    const mt = args.indexOf("--max-turns");
-    const maxTurns = mt >= 0 ? Number(args.splice(mt, 2)[1]) : 25;
-    await run(args[0], maxTurns).catch((e) => { console.error(e.message); process.exit(1); });
+    try {
+      const mt = args.indexOf("--max-turns");
+      const maxTurns = mt >= 0 ? parsePositiveIntegerFlag("--max-turns", args.splice(mt, 2)[1]) : 25;
+      await run(args[0], maxTurns);
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
   }
 }
