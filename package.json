@@ -1,6 +1,10 @@
 {
   "name": "skynet",
-  "module": "index.ts",
+  "scripts": {
+    "test": "bun test smoke.test.ts",
+    "selftest": "bun skynet.ts --selftest",
+    "typecheck": "bunx tsc --noEmit"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
