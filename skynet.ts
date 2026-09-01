@@ -3,6 +3,7 @@
 //   bun skynet.ts <git-url|path> [--max-turns N]
 //   bun skynet.ts evolve [--generations N] [--goal "text"] [--max-turns N]
 //   bun skynet.ts --selftest
+//   bun skynet.ts --version
 import { OpenRouter } from "@openrouter/sdk";
 import type { ChatMessages, ChatFunctionTool, ChatToolCall } from "@openrouter/sdk/models";
 import { existsSync, mkdirSync, readFileSync, readdirSync, appendFileSync } from "fs";
@@ -12,6 +13,7 @@ const HOME = process.env.SKYNET_HOME ?? join(process.env.HOME!, ".skynet");
 const MEMORY = join(HOME, "memory.md");
 const WORK = join(HOME, "work");
 const MODEL = process.env.SKYNET_MODEL ?? "z-ai/glm-5.3-flash";
+export const VERSION = "0.1.0";
 
 // ---------- shell ----------
 export async function sh(cmd: string, cwd: string, timeoutMs = 120_000) {
@@ -251,17 +253,20 @@ async function selftest() {
   const f2 = parseEvolveFlags(["--generations", "5", "--goal", "x y", "--max-turns", "7"]);
   assert(f2.generations === 5 && f2.goal === "x y" && f2.maxTurns === 7, "parseEvolveFlags overrides");
 
+  assert(VERSION === "0.1.0", "--version reports 0.1.0");
+
   console.log("selftest ok");
 }
 
 if (import.meta.main) {
   const args = process.argv.slice(2);
-  if (args[0] === "--selftest") await selftest();
+  if (args[0] === "--version") console.log(VERSION);
+  else if (args[0] === "--selftest") await selftest();
   else if (args[0] === "evolve") {
     const { generations, goal, maxTurns } = parseEvolveFlags(args.slice(1));
     await evolve(generations, goal, maxTurns).catch((e) => { console.error(e.message); process.exit(1); });
   } else if (!args[0]) {
-    console.error("usage: bun skynet.ts <git-url|path> [--max-turns N] | evolve [--generations N] [--goal text] [--max-turns N] | --selftest");
+    console.error("usage: bun skynet.ts <git-url|path> [--max-turns N] | evolve [--generations N] [--goal text] [--max-turns N] | --selftest | --version");
     process.exit(1);
   } else {
     const mt = args.indexOf("--max-turns");
