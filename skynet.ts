@@ -78,6 +78,20 @@ const bashTool: ChatFunctionTool = {
   },
 };
 
+// ---------- tool-call boundary ----------
+// guard the tool-call boundary: model-provided tool arguments are untrusted, so parse
+// defensively and return { error } instead of letting one malformed call crash the whole
+// repair/evolve run.
+export function parseToolCmd(raw: string): { cmd: string } | { error: string } {
+  try {
+    const parsed = JSON.parse(raw) as { cmd?: unknown };
+    if (typeof parsed?.cmd !== "string") return { error: "missing or non-string cmd" };
+    return { cmd: parsed.cmd };
+  } catch {
+    return { error: "invalid JSON" };
+  }
+}
+
 // generic tool-loop: give the model a bash tool in `dir` until it replies with no tool calls.
 // returns the text after "LESSON:" on its final line, or null if maxTurns ran out / no lesson.
 // usage accounting: the SDK always returns full usage per response (no request flag needed).
@@ -109,7 +123,13 @@ export async function agentLoop(dir: string, system: string, user: string, maxTu
       return { lesson: text.match(/^LESSON:(.*)$/m)?.[1] ?? null, totalCost };
     }
     for (const c of calls) {
-      const { cmd } = JSON.parse(c.function.arguments) as { cmd: string };
+      const parsed = parseToolCmd(c.function.arguments);
+      if ("error" in parsed) {
+        // bounce malformed arguments back to the model as a tool message so it can retry
+        messages.push({ role: "tool", toolCallId: c.id, content: `exit 1\nblocked: malformed tool arguments, expected {"cmd": string}` });
+        continue;
+      }
+      const cmd = parsed.cmd;
       console.log(`$ ${cmd}`);
       // ponytail: heuristic denylist (dir escape, .env, sudo), not a sandbox. Real containment needs bwrap/firejail/chroot if this matters more.
       const blocked = /(^|[\s;&|])cd\s+(\.\.|~|\/)|\.env\b|\bsudo\b/.test(cmd);
@@ -280,6 +300,11 @@ async function selftest() {
   assert(f1.generations === 3 && f1.goal === undefined && f1.maxTurns === 15, "parseEvolveFlags defaults");
   const f2 = parseEvolveFlags(["--generations", "5", "--goal", "x y", "--max-turns", "7"]);
   assert(f2.generations === 5 && f2.goal === "x y" && f2.maxTurns === 7, "parseEvolveFlags overrides");
+
+  const pc = parseToolCmd('{"cmd":"ls"}');
+  assert("cmd" in pc && pc.cmd === "ls", "parseToolCmd accepts valid cmd");
+  assert("error" in parseToolCmd('"{nope"'), "parseToolCmd rejects unparseable args");
+  assert("error" in parseToolCmd('{"x":1}'), "parseToolCmd rejects missing/non-string cmd");
 
   assert(VERSION === "0.1.0", "--version reports 0.1.0");
 
