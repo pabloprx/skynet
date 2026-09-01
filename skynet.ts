@@ -96,7 +96,11 @@ export async function agentLoop(dir: string, system: string, user: string, maxTu
     for (const c of calls) {
       const { cmd } = JSON.parse(c.function.arguments) as { cmd: string };
       console.log(`$ ${cmd}`);
-      const r = await sh(cmd, dir);
+      // ponytail: heuristic denylist (dir escape, .env, sudo), not a sandbox. Real containment needs bwrap/firejail/chroot if this matters more.
+      const blocked = /(^|[\s;&|])cd\s+(\.\.|~|\/)|\.env\b|\bsudo\b/.test(cmd);
+      const r = blocked
+        ? { code: 1, text: "blocked: command attempts to leave the working directory or touch .env/sudo" }
+        : await sh(cmd, dir);
       messages.push({ role: "tool", toolCallId: c.id, content: `exit ${r.code}\n${r.text}` });
     }
   }
@@ -176,6 +180,11 @@ async function pickGoal(childDir: string) {
 export async function evolve(generations: number, goalArg: string | undefined, maxTurns: number) {
   const ROOT = import.meta.dir;
   await ensureRepo(ROOT);
+  // commit any pre-existing dirty state in ROOT *before* cloning, so the child (and its later
+  // gen commit) descends from it — otherwise the child's commit and a post-clone pre-evolve
+  // commit are siblings and the ff-only pull below can never fast-forward.
+  const dirty0 = await sh("git status --porcelain", ROOT);
+  if (dirty0.text.trim()) await sh(`git add -A && git commit -qm "chore: pre-evolve"`, ROOT);
 
   const genRoot = join(HOME, "gen");
   mkdirSync(genRoot, { recursive: true });
@@ -205,8 +214,6 @@ When done, reply with exactly one line starting with "LESSON:".`;
 
   if (gate.code === 0 && diff.text.trim()) {
     await sh(`git add -A && git commit -qm ${JSON.stringify(`evolve gen ${n}: ${goal}`)}`, child);
-    const dirty = await sh("git status --porcelain", ROOT);
-    if (dirty.text.trim()) await sh(`git add -A && git commit -qm "chore: pre-evolve"`, ROOT);
     const pull = await sh(`git pull --ff-only ${JSON.stringify(child)} HEAD`, ROOT, 60_000);
     if (pull.code !== 0) throw new Error(`ff-only pull failed: ${pull.text}`);
     learn("self", `gen ${n} promoted: ${goal}: ${lesson ?? "(no lesson)"}`);
