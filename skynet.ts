@@ -8,7 +8,7 @@
 //   bun skynet.ts --version
 import { OpenRouter } from "@openrouter/sdk";
 import type { ChatMessages, ChatFunctionTool, ChatToolCall } from "@openrouter/sdk/models";
-import { existsSync, mkdirSync, readFileSync, readdirSync, appendFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, appendFileSync, chmodSync } from "fs";
 import { basename, join, resolve } from "path";
 import { tmpdir } from "os";
 
@@ -162,6 +162,29 @@ export async function agentLoop(
   maxCost = Infinity,
   childEnv?: Record<string, string>,
 ) {
+  if (process.env.SKYNET_PROVIDER === "claude") {
+    const prompt = `${system}\n\n${user}`;
+    const p = Bun.spawn(["claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits", "--allowedTools", "Bash", "Read", "Edit", "Write", "Glob", "Grep", "--max-turns", String(maxTurns)], { cwd: dir, stdout: "pipe", stderr: "pipe", env: { ...process.env, ...childEnv, SKYNET_CHILD: "1" } });
+    p.unref();
+    const read = async (stream: ReadableStream<Uint8Array>) => new Response(stream).text();
+    const output = Promise.all([read(p.stdout), read(p.stderr), p.exited]);
+    const timer = delay(600_000);
+    const completed = await Promise.race([output, timer.done.then(() => null)]);
+    timer.cancel();
+    if (completed === null) {
+      p.kill(9);
+      const grace = delay(KILL_GRACE_MS); await Promise.race([output, grace.done]); grace.cancel();
+      throw new Error("claude timed out after 600000ms");
+    }
+    const [stdout, stderr, code] = completed;
+    if (code !== 0) throw new Error(`claude failed (exit ${code}): ${stderr || stdout}`);
+    let result: any;
+    try { result = JSON.parse(stdout); } catch { throw new Error(`claude returned invalid JSON: ${stdout.slice(-2_000)}`); }
+    if (result?.is_error) throw new Error(`claude reported an error: ${result.result ?? "unknown error"}`);
+    const totalCost = typeof result?.total_cost_usd === "number" ? result.total_cost_usd : 0;
+    if (totalCost > maxCost) return { lesson: null, totalCost, budgetExceeded: true };
+    return { lesson: result?.result ?? null, totalCost, budgetExceeded: false };
+  }
   const client = new OpenRouter({ apiKey: process.env.OPENROUTER_KEY });
   const messages: ChatMessages[] = [
     { role: "system", content: [{ type: "text", text: system, cacheControl: { type: "ephemeral" } }] },
@@ -559,6 +582,17 @@ async function selftest() {
   assert(isBlockedCmd("cat .env"), "denylist blocks .env");
   assert(isBlockedCmd("bun skynet.ts evolve --goal x"), "denylist blocks recursive evolve");
   assert(!isBlockedCmd("echo hi"), "denylist allows plain commands");
+  {
+    const fakeBin = join(scratch, "fake-bin"); mkdirSync(fakeBin, { recursive: true });
+    const fakeClaude = join(fakeBin, "claude");
+    await Bun.write(fakeClaude, `#!/bin/sh\nprintf '%s\n' '{"result":"local lesson","total_cost_usd":0.0123,"is_error":false}'\n`);
+    chmodSync(fakeClaude, 0o755);
+    const oldProvider = process.env.SKYNET_PROVIDER; const oldPath = process.env.PATH;
+    process.env.SKYNET_PROVIDER = "claude"; process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
+    try { const localResult = await agentLoop(tmp, "system prompt", "user prompt", 2); assert(localResult.lesson === "local lesson" && localResult.totalCost === 0.0123, "claude provider uses local binary"); }
+    finally { if (oldProvider === undefined) delete process.env.SKYNET_PROVIDER; else process.env.SKYNET_PROVIDER = oldProvider; if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath; }
+  }
+
 
   assert(disallowedDiffFiles(["smoke.test.ts"], "fix bug").length === 1, "smoke.test.ts always disallowed");
   assert(disallowedDiffFiles(["skynet.ts"], "fix bug").length === 0, "skynet.ts allowed");
