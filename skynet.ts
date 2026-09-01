@@ -16,12 +16,43 @@ const MODEL = process.env.SKYNET_MODEL ?? "z-ai/glm-5.3-flash";
 export const VERSION = "0.1.0";
 
 // ---------- shell ----------
+// cancellable delay: a bare Bun.sleep can't be cancelled, and a still-pending one keeps bun's event
+// loop alive after sh() resolves (measured: a 60s sleep pinned process exit for the full 60s)
+function delay(ms: number) {
+  let fire!: () => void;
+  const done = new Promise<void>((res) => (fire = res));
+  const t = setTimeout(fire, ms);
+  return { done, cancel: () => { clearTimeout(t); fire(); } };
+}
+
+const KILL_GRACE_MS = 2_000;
+
 export async function sh(cmd: string, cwd: string, timeoutMs = 120_000) {
   const p = Bun.spawn(["bash", "-lc", cmd], { cwd, stdout: "pipe", stderr: "pipe" });
-  const t = setTimeout(() => p.kill(), timeoutMs);
-  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
-  clearTimeout(t);
-  return { code, text: (out + err).slice(-20_000) }; // ponytail: tail-cap output, add smarter trimming if repos exceed it
+  p.unref(); // don't let a timed-out command's orphans pin bun's event loop open after sh() resolves
+  const parts = { out: "", err: "" };
+  const pump = async (stream: ReadableStream<Uint8Array>, key: "out" | "err") => {
+    const dec = new TextDecoder();
+    for await (const chunk of stream) parts[key] += dec.decode(chunk, { stream: true });
+    parts[key] += dec.decode();
+  };
+  // race streams + exit against the timeout: a killed bash's grandchildren inherit the pipes and
+  // would otherwise pin EOF forever, so Promise.all alone bounds nothing
+  const collect = (async () => {
+    await Promise.all([pump(p.stdout, "out"), pump(p.stderr, "err")]);
+    return p.exited;
+  })();
+  const timer = delay(timeoutMs);
+  const code = await Promise.race([collect, timer.done.then(() => null)]);
+  timer.cancel();
+  if (code === null) {
+    p.kill(9); // SIGKILL: SIGTERM is trappable (`trap '' TERM`) and grandchildren can outlive it anyway
+    const grace = delay(KILL_GRACE_MS);
+    await Promise.race([collect, grace.done]); // let buffered output drain; give up if pipes stay wedged
+    grace.cancel();
+    return { code: 124, text: (parts.out + parts.err + `\n[skynet: timed out after ${timeoutMs}ms]`).slice(-20_000) };
+  }
+  return { code, text: (parts.out + parts.err).slice(-20_000) }; // ponytail: tail-cap output, add smarter trimming if repos exceed it
 }
 
 // ---------- clone ----------
@@ -287,6 +318,15 @@ async function selftest() {
   assert(detectTestCmd(badPkgDir) === "bun test", "detect bun test with malformed package.json");
   assert((await sh("exit 3", tmp)).code === 3, "sh exit code");
   assert((await sh("echo hi", tmp)).text.trim() === "hi", "sh output");
+  {
+    // timeout must actually bound the call: the sleeping grandchild inherits the pipes, so a
+    // SIGTERM-only kill of bash used to leave the stream collect wedged until sleep 30 finished
+    const t0 = Date.now();
+    const r = await sh("sleep 30", tmp, 300);
+    const ms = Date.now() - t0;
+    assert(r.code !== 0 && ms < 10_000, `sh timeout enforced (got code ${r.code} after ${ms}ms)`);
+    assert(r.text.includes("[skynet: timed out after 300ms]"), "sh timeout reports itself to the model");
+  }
   const local = await clone(tmp); assert(local === resolve(tmp), "clone local path passthrough");
   learn("selftest", "memory works"); assert(recall().includes("selftest: memory works"), "learn/recall");
 
