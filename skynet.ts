@@ -75,23 +75,33 @@ const bashTool: ChatFunctionTool = {
 
 // generic tool-loop: give the model a bash tool in `dir` until it replies with no tool calls.
 // returns the text after "LESSON:" on its final line, or null if maxTurns ran out / no lesson.
+// usage accounting: the SDK always returns full usage per response (no request flag needed).
+// caching: mark the system prompt (the stable prefix) with an Anthropic-style cache_control
+// breakpoint; OpenRouter converts it to whatever the serving provider needs (OpenAI-style
+// prompt_cache_breakpoint, native Anthropic cache_control, or ignores it if unsupported).
 export async function agentLoop(dir: string, system: string, user: string, maxTurns: number) {
   const client = new OpenRouter({ apiKey: process.env.OPENROUTER_KEY });
   const messages: ChatMessages[] = [
-    { role: "system", content: system },
+    { role: "system", content: [{ type: "text", text: system, cacheControl: { type: "ephemeral" } }] },
     { role: "user", content: user },
   ];
+  let totalCost = 0;
 
   for (let turn = 0; turn < maxTurns; turn++) {
     const res = await client.chat.send({ chatRequest: { model: MODEL, messages, tools: [bashTool] } });
     if (!("choices" in res)) throw new Error("unexpected streaming response");
+    const u = res.usage;
+    totalCost += u?.cost ?? 0;
+    console.log(
+      `turn ${turn + 1}: prompt=${u?.promptTokens ?? "?"} cached=${u?.promptTokensDetails?.cachedTokens ?? 0} completion=${u?.completionTokens ?? "?"} cost=$${(u?.cost ?? 0).toFixed(6)}`,
+    );
     const msg = res.choices[0]!.message;
     messages.push({ role: "assistant", content: msg.content ?? null, toolCalls: msg.toolCalls } as ChatMessages);
     if (typeof msg.content === "string" && msg.content) console.log(msg.content);
     const calls: ChatToolCall[] = msg.toolCalls ?? [];
     if (!calls.length) {
       const text = typeof msg.content === "string" ? msg.content : "";
-      return text.match(/^LESSON:(.*)$/m)?.[1] ?? null;
+      return { lesson: text.match(/^LESSON:(.*)$/m)?.[1] ?? null, totalCost };
     }
     for (const c of calls) {
       const { cmd } = JSON.parse(c.function.arguments) as { cmd: string };
@@ -104,7 +114,7 @@ export async function agentLoop(dir: string, system: string, user: string, maxTu
       messages.push({ role: "tool", toolCallId: c.id, content: `exit ${r.code}\n${r.text}` });
     }
   }
-  return null;
+  return { lesson: null, totalCost };
 }
 
 export async function repair(dir: string, testCmd: string, failure: string, maxTurns: number) {
@@ -125,13 +135,14 @@ export async function run(target: string, maxTurns: number) {
   const first = await sh(testCmd, dir, 600_000);
   if (first.code === 0) return console.log("tests already pass");
 
-  const lesson = await repair(dir, testCmd, first.text, maxTurns);
+  const { lesson, totalCost } = await repair(dir, testCmd, first.text, maxTurns);
   const after = await sh(testCmd, dir, 600_000);
   if (after.code !== 0) throw new Error(`still failing after ${maxTurns} turns:\n${after.text}`);
 
   await sh(`git add -A && git commit -qm "fix: skynet auto-repair" || true`, dir);
   learn(basename(dir), lesson ?? "fixed failing tests (no lesson reported)");
   console.log(`repaired + committed. memory: ${MEMORY}`);
+  console.log(`total cost: $${totalCost.toFixed(6)}`);
 }
 
 // ---------- evolve ----------
@@ -203,7 +214,8 @@ export async function evolve(generations: number, goalArg: string | undefined, m
   const system = `You are skynet, improving your own source at ${child}. Goal: ${goal}.
 Constraints: only edit files inside this directory, never touch .env, keep "bun skynet.ts --selftest" and "bunx tsc --noEmit" passing, add one selftest assertion covering your change, do not commit.
 When done, reply with exactly one line starting with "LESSON:".`;
-  const lesson = await agentLoop(child, system, "Make the change now.", maxTurns);
+  const { lesson, totalCost } = await agentLoop(child, system, "Make the change now.", maxTurns);
+  console.log(`gen ${n} total cost: $${totalCost.toFixed(6)}`);
 
   const gate = await sh(
     `bun install && bunx tsc --noEmit && SKYNET_HOME=${JSON.stringify(join(child, ".tmp"))} bun skynet.ts --selftest`,
