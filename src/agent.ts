@@ -19,6 +19,12 @@ function logUsage(turn: number, u: Usage): number {
 const textOf = (content: unknown) => (typeof content === "string" ? content : "");
 const lessonOf = (text: string) => text.match(/^LESSON:(.*)$/m)?.[1] ?? null;
 
+// evolve()'s onTurn callback appends a "turn" trace event per turn - factored out so agentLoop's
+// own cyclomatic complexity (eslint's `complexity` gate) doesn't grow with each new optional caller hook.
+function reportTurn(onTurn: ((turn: number, cost: number) => void) | undefined, turn: number, cost: number) {
+  if (onTurn) onTurn(turn, cost);
+}
+
 async function runTools(dir: string, calls: ChatToolCall[], messages: ChatMessages[], childEnv?: Record<string, string>) {
   for (const c of calls) {
     const parsed = parseToolCmd(c.function.arguments);
@@ -51,6 +57,7 @@ export async function agentLoop(
   maxTurns: number,
   maxCost = Infinity,
   childEnv?: Record<string, string>,
+  onTurn?: (turn: number, cost: number) => void,
 ) {
   if (useClaude()) return claudeRun(dir, system, user, maxTurns, maxCost, childEnv);
   if (provider() === "ollama") console.log("ollama: no cost reporting, budget caps by turns only");
@@ -63,6 +70,7 @@ export async function agentLoop(
   for (let turn = 0; turn < maxTurns; turn++) {
     const { msg, usage } = await chat(MODEL(), messages, [bashTool]);
     totalCost += logUsage(turn, usage);
+    reportTurn(onTurn, turn + 1, totalCost);
     if (totalCost > maxCost) {
       console.log(`budget exceeded: $${totalCost.toFixed(6)} > $${maxCost.toFixed(6)}, stopping`);
       return { lesson: null, totalCost, budgetExceeded: true };

@@ -8,6 +8,7 @@ import { gate, ALWAYS_PROTECTED_FILES } from "./gate.ts";
 import { agentLoop } from "./agent.ts";
 import { chat } from "./providers/index.ts";
 import { appendTrace } from "./trace.ts";
+import { maybeStartUi } from "./ui/server.ts";
 
 export function nextGenDir(genRoot: string): number {
   if (!existsSync(genRoot)) return 1;
@@ -52,7 +53,9 @@ export function parseEvolveFlags(argv: string[]) {
   const mti = flags.indexOf("--max-turns");
   const maxTurns = mti >= 0 ? parsePositiveIntegerFlag("--max-turns", flags.splice(mti, 2)[1]) : 15;
   const budget = parseBudgetFlag(flags);
-  return { generations, goal, maxTurns, budget };
+  const noUi = flags.includes("--no-ui");
+  if (noUi) flags.splice(flags.indexOf("--no-ui"), 1);
+  return { generations, goal, maxTurns, budget, noUi };
 }
 
 export async function resolveGoal(value: string): Promise<string> {
@@ -126,17 +129,19 @@ export async function promote(child: string, n: number, goal: string) {
   if (pull.code !== 0) throw new Error(`ff-only pull failed: ${pull.text}`);
 }
 
-async function spawnNextGen(remaining: number, maxTurns: number, budget: number, goalArg: string | undefined) {
+async function spawnNextGen(remaining: number, maxTurns: number, budget: number, goalArg: string | undefined, noUi: boolean) {
   const argv = ["evolve", "--generations", String(remaining), "--max-turns", String(maxTurns), "--budget", String(budget)];
   if (goalArg) argv.push("--goal", goalArg);
+  if (noUi) argv.push("--no-ui");
   // same DEPTH: the next gen is a sibling continuation (bounded by --generations), not a nested
   // spawn; DEPTH+1 here made gen 3 of a default run always fail gate's depth-capped selftest.
   const p = Bun.spawn(["bun", join(ROOT, "skynet.ts"), ...argv], { cwd: ROOT, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env, SKYNET_DEPTH: String(DEPTH) } });
   process.exit(await p.exited);
 }
 
-export async function evolve(generations: number, goalArg: string | undefined, maxTurns: number, budget: number) {
+export async function evolve(generations: number, goalArg: string | undefined, maxTurns: number, budget: number, noUi = false) {
   if (process.env.SKYNET_CHILD) throw new Error("evolve: refusing to run recursively inside a child (SKYNET_CHILD is set)");
+  maybeStartUi(!noUi);
   const { n, child } = await prepareChild();
   if (existsSync(join(ROOT, ".env"))) await Bun.write(join(child, ".env"), readFileSync(join(ROOT, ".env")));
   // --ignore-scripts: package.json here is whatever a prior generation promoted — gate() now also
@@ -154,7 +159,15 @@ Constraints: only edit files inside this directory, never touch .env, keep "bun 
 Never touch these files: ${ALWAYS_PROTECTED_FILES.join(", ")} — any change to them causes automatic rejection. package.json and bun.lock are also rejected unless this goal explicitly asks for a dependency change.
 Never run "bun skynet.ts evolve" or "bun skynet.ts <target>" — this is a self-modification task, not an evolve/repair run; that is blocked and will fail.
 When done, reply with exactly one line starting with "LESSON:".`;
-  const { lesson, totalCost, budgetExceeded } = await agentLoop(child, system, "Make the change now.", maxTurns, budget, { SKYNET_CHILD: "1", SKYNET_DEPTH: String(DEPTH + 1) });
+  const { lesson, totalCost, budgetExceeded } = await agentLoop(
+    child,
+    system,
+    "Make the change now.",
+    maxTurns,
+    budget,
+    { SKYNET_CHILD: "1", SKYNET_DEPTH: String(DEPTH + 1) },
+    (turn, cost) => appendTrace(n, "turn", { turn, cost }),
+  );
   console.log(`gen ${n} total cost: $${totalCost.toFixed(6)}`);
 
   const gateResult = budgetExceeded
@@ -173,5 +186,5 @@ When done, reply with exactly one line starting with "LESSON:".`;
   }
 
   const remaining = generations - 1;
-  if (remaining > 0) await spawnNextGen(remaining, maxTurns, budget, goalArg);
+  if (remaining > 0) await spawnNextGen(remaining, maxTurns, budget, goalArg, noUi);
 }

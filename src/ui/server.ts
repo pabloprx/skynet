@@ -5,7 +5,7 @@ import { join } from "path";
 import { HOME, ROOT } from "../config.ts";
 import { sh } from "../shell.ts";
 import { buildArchitectureIR, buildLifecycleIR } from "./ir.ts";
-import { traceDir, traceRows } from "../trace.ts";
+import { traceDir, genSummaries, type GenSummary } from "../trace.ts";
 
 const ARCHIFY_URL = "https://github.com/tt-a1i/archify";
 const ARCHIFY_SHA = "5769acefcc2ebd696a4f9ed3ac9cb6cca1d75c70";
@@ -75,16 +75,26 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 }
 
+function statusCellHtml(r: GenSummary): string {
+  if (r.status === "running") return `running (turn ${r.turns})`;
+  return escapeHtml(r.status);
+}
+
 function logTableHtml(): string {
-  const rows = traceRows();
+  const rows = genSummaries();
   if (!rows.length) return "<p>no generations logged yet.</p>";
-  const trs = rows.map((r) => `<tr><td>${r.gen}</td><td>${escapeHtml(r.event)}</td><td>$${r.cost.toFixed(4)}</td><td>${escapeHtml(r.goal)}</td></tr>`).join("");
-  return `<table><thead><tr><th>gen</th><th>event</th><th>cost</th><th>goal</th></tr></thead><tbody>${trs}</tbody></table>`;
+  const trs = rows
+    .map(
+      (r) =>
+        `<tr><td>${r.gen}</td><td>${statusCellHtml(r)}</td><td>${r.turns}</td><td>$${r.cost.toFixed(4)}</td><td>${escapeHtml(r.goal.slice(0, 80))}</td><td>${escapeHtml(r.status === "rejected" ? (r.reason ?? "") : "")}</td></tr>`,
+    )
+    .join("");
+  return `<table><thead><tr><th>gen</th><th>status</th><th>turns</th><th>cost</th><th>goal</th><th>reason</th></tr></thead><tbody>${trs}</tbody></table>`;
 }
 
 function indexHtml(result: BuildResult): string {
   const err = (r: RenderResult, label: string) => (r.ok ? "" : `<p class="err">${label} render failed: ${escapeHtml(r.error ?? "")}</p>`);
-  return `<!doctype html><html><head><meta charset="utf-8"><title>skynet</title>
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5"><title>skynet</title>
 <style>
 body{background:#111;color:#eee;font-family:ui-monospace,monospace;padding:2rem;max-width:900px;margin:0 auto}
 a{color:#6cf} table{border-collapse:collapse;width:100%} td,th{border:1px solid #444;padding:4px 8px;text-align:left}
@@ -98,8 +108,10 @@ ${logTableHtml()}
 </body></html>`;
 }
 
-function serve(port: number) {
-  const server = Bun.serve({
+// shared by the standalone "ui" command and evolve/adopt's auto-started UI; throws (e.g. port
+// already in use) rather than swallowing errors - callers decide what "already running" means.
+export function startServer(port: number) {
+  return Bun.serve({
     port,
     async fetch(req) {
       const path = new URL(req.url).pathname;
@@ -111,9 +123,37 @@ function serve(port: number) {
       return new Response("not found", { status: 404 });
     },
   });
+}
+
+function serve(port: number) {
+  const server = startServer(port);
   // log the actual bound port, not the requested one: --port 0 asks the OS for a free port, so
   // the literal CLI argument is never the real address.
   console.log(`skynet ui: http://localhost:${server.port}`);
+}
+
+export const DEFAULT_UI_PORT = 3333;
+
+export function uiPort(): number {
+  const raw = Number(process.env.SKYNET_UI_PORT);
+  return Number.isInteger(raw) && raw >= 0 && raw <= 65535 ? raw : DEFAULT_UI_PORT;
+}
+
+// evolve()/adopt() call this at startup so a live run's log/lifecycle diagram are visible without
+// a separate `ui` invocation: starts the server in-process on `uiPort()`, or - if that port is
+// already taken (by another skynet run, most likely) - just reports the same URL. Never blocks
+// the caller (Bun.serve is non-blocking) and unref()s the handle so it alone can't keep the
+// process alive once the run finishes. A child (SKYNET_CHILD set) never starts a server.
+export function maybeStartUi(enabled: boolean): void {
+  if (!enabled || process.env.SKYNET_CHILD) return;
+  const port = uiPort();
+  try {
+    const server = startServer(port);
+    server.unref();
+    console.log(`ui: http://localhost:${server.port}`);
+  } catch {
+    console.log(`ui: http://localhost:${port}`);
+  }
 }
 
 // --port 0 is a real, intentional value ("ask the OS for a free port"), so this can't reuse

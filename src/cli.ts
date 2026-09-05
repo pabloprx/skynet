@@ -4,7 +4,7 @@ import { evolve, revert, parseEvolveFlags, parsePositiveIntegerFlag } from "./ev
 import { adopt, parseAdoptFlags } from "./adopt.ts";
 import { printLog } from "./trace.ts";
 
-const USAGE = "usage: bun skynet.ts <git-url|path> [--max-turns N] | evolve [--generations N] [--goal text|url|path] [--max-turns N] [--budget usd] | adopt <git-url> [--ref ref] [--budget usd] | revert | ui [--port N] [--build] | log | --selftest | --version";
+const USAGE = "usage: bun skynet.ts <git-url|path> [--max-turns N] | evolve [--generations N] [--goal text|url|path] [--max-turns N] [--budget usd] [--no-ui] | adopt <git-url> [--ref ref] [--budget usd] [--no-ui] | revert | ui [--port N] [--build] | log | --selftest | --version";
 
 function fail(e: unknown): never {
   console.error(e instanceof Error ? e.message : String(e));
@@ -19,12 +19,12 @@ async function runCmd(args: string[]) {
 
 async function runSubcommand(cmd: string, rest: string[]) {
   if (cmd === "evolve") {
-    const { generations, goal, maxTurns, budget } = parseEvolveFlags(rest);
-    return evolve(generations, goal, maxTurns, budget);
+    const { generations, goal, maxTurns, budget, noUi } = parseEvolveFlags(rest);
+    return evolve(generations, goal, maxTurns, budget, noUi);
   }
   if (cmd === "adopt") {
-    const { url, ref, budget } = parseAdoptFlags(rest);
-    return adopt(url, ref, budget);
+    const { url, ref, budget, noUi } = parseAdoptFlags(rest);
+    return adopt(url, ref, budget, noUi);
   }
   if (cmd === "revert") return revert();
   if (cmd === "log") return printLog();

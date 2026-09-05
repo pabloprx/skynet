@@ -27,7 +27,7 @@ the fix and appends a lesson to memory. `--max-turns` (default 25) caps the
 repair loop.
 
 ```
-bun skynet.ts evolve [--generations N] [--goal "text|url|path"] [--max-turns N] [--budget usd]
+bun skynet.ts evolve [--generations N] [--goal "text|url|path"] [--max-turns N] [--budget usd] [--no-ui]
 ```
 Self-modification: clone skynet's own repo into `~/.skynet/gen/N`, let the
 LLM edit it toward a goal (auto-picked if `--goal` is omitted), then run it
@@ -39,9 +39,10 @@ into the parent repo and re-exec for the next generation.
   local file path (read). See [Sharing](#sharing).
 - `--max-turns` (default 15): tool-loop turn cap per generation.
 - `--budget` (default 0.05): USD spend cap per generation; exceeding it fails the gate.
+- `--no-ui`: skip auto-starting the web UI (see [Web UI](#web-ui)).
 
 ```
-bun skynet.ts adopt <git-url> [--ref ref] [--budget usd]
+bun skynet.ts adopt <git-url> [--ref ref] [--budget usd] [--no-ui]
 ```
 Pull another skynet's code through the same gate, instead of an LLM
 generating the diff. Clones skynet's own repo into `~/.skynet/gen/N` (same as
@@ -51,6 +52,7 @@ LLM call, so cost is $0 unless `SKYNET_REVIEW_MODEL` is set. See
 [Sharing](#sharing).
 - `--ref` (default `main`): branch/ref to pull from `git-url`.
 - `--budget` (default 0.05): accepted for parity with `evolve`; unused since `adopt` makes no LLM call.
+- `--no-ui`: skip auto-starting the web UI (see [Web UI](#web-ui)).
 
 ```
 bun skynet.ts revert
@@ -133,7 +135,9 @@ bun skynet.ts ui [--port N] [--build]
 ```
 Serves an architecture diagram (module import graph of `src/`) and a
 lifecycle diagram (recent `evolve` generations) as standalone HTML, plus a
-generation log table. Rendering is delegated to
+generation log table (one row per generation: status, turns so far, cost so
+far, goal, and the rejection reason if any) that live-updates via a 5s meta
+refresh. Rendering is delegated to
 [archify](https://github.com/tt-a1i/archify) (pinned commit
 `5769acefcc2ebd696a4f9ed3ac9cb6cca1d75c70`), auto-cloned into
 `~/.skynet/archify` on first use - requires `node` on `PATH`. `--port`
@@ -141,10 +145,18 @@ generation log table. Rendering is delegated to
 `~/.skynet/ui/*.html` and exits instead of serving. Set `SKYNET_ARCHIFY` to
 point at an existing archify checkout to skip the auto-clone.
 
+`evolve` and `adopt` auto-start this UI (in-process, non-blocking) on port
+`3333` by default (override with `SKYNET_UI_PORT`, or skip with `--no-ui`);
+if that port is already taken (e.g. an earlier generation in the same run
+already started it) they just print its URL instead of starting a second
+server. A generation still shown as "running" after the process was
+killed (e.g. `SIGINT`) stays "running" forever - there is no way to tell a
+killed run from a slow one from the trace file alone.
+
 ```
 bun skynet.ts log
 ```
-Prints the generation log (gen, event, cost, goal) parsed from
+Prints the generation log (gen, status, turns, cost, goal) parsed from
 `~/.skynet/trace/gen-*.jsonl` - same data the web UI's log table shows.
 
 ## Environment variables
@@ -159,6 +171,7 @@ Prints the generation log (gen, event, cost, goal) parsed from
 | `OLLAMA_API_KEY` | Required when `SKYNET_PROVIDER=ollama`. |
 | `OLLAMA_URL` | Ollama Cloud endpoint. Default `https://ollama.com/v1`. |
 | `SKYNET_ARCHIFY` | Point `ui`/`ui --build` at an existing archify checkout instead of auto-cloning one into `~/.skynet/archify`. |
+| `SKYNET_UI_PORT` | Port `evolve`/`adopt` auto-start the web UI on. Default `3333`. |
 | `SKYNET_CHILD` | Internal only. Set by the parent inside a gated child process; do not set this yourself. It disables recursive `evolve`/repair runs and the `ui` command. |
 
 ## Cost

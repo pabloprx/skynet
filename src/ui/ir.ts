@@ -236,19 +236,51 @@ export function buildArchitectureIR(root: string): ArchitectureIR {
 
 // ---------- lifecycle ----------
 type GenType = "success" | "failure" | "active";
-interface GenState { gen: number; goal: string; cost: number; type: GenType }
+interface GenState { gen: number; goal: string; cost: number; turns: number; type: GenType }
 interface LifecycleState { id: string; type: GenType | "neutral" | "start"; label: string; sublabel: string; lane: "main"; col: number }
 interface Transition { id: string; from: string; to: string }
 
+// "turn" events and the terminal promoted/rejected event both carry the *cumulative* cost so far,
+// not a per-event delta - take the last one seen rather than summing (summing would double-count
+// the turns already folded into the terminal event's total).
+function lastCost(events: TraceEvent[]): number {
+  const costs = events.map((e) => e.cost).filter((c): c is number => c !== undefined);
+  return costs.length ? costs[costs.length - 1]! : 0;
+}
+
 function collapseGen(gen: number, events: TraceEvent[]): GenState {
   const goal = events.find((e) => e.event === "start")?.goal ?? "";
-  const cost = events.reduce((sum, e) => sum + (e.cost ?? 0), 0);
+  const turns = events.filter((e) => e.event === "turn").length;
   const type: GenType = events.some((e) => e.event === "promoted")
     ? "success"
     : events.some((e) => e.event === "rejected" || e.event === "reverted")
       ? "failure"
       : "active";
-  return { gen, goal: goal.slice(0, 24), cost, type };
+  return { gen, goal, cost: lastCost(events), turns, type };
+}
+
+// archify's lifecycle validator (renderers/lifecycle/render-lifecycle.mjs, ~L190-198, via
+// renderers/shared/text-fit.mjs's minimumNodeTextWidth/availableNodeTextWidth) rejects a sublabel
+// whose width at the 6px legible minimum exceeds the state's available text width. These states
+// never set state.width, so the renderer's default phase-lane width applies (layout.phaseW =
+// 118px): available = 118 - 8px padding = 110px; minimum px/char at 6px = 6 * 0.6 = 3.6, so the
+// longest sublabel that always fits is floor(110 / 3.6) = 30 chars.
+const MAX_SUBLABEL_CHARS = 30;
+
+function fitSublabel(prefix: string, goal: string): string {
+  const budget = MAX_SUBLABEL_CHARS - prefix.length;
+  if (budget <= 0) return prefix.slice(0, MAX_SUBLABEL_CHARS);
+  if (goal.length <= budget) return prefix + goal;
+  return prefix + (budget > 1 ? goal.slice(0, budget - 1) + "…" : goal.slice(0, budget));
+}
+
+function lifecycleLabel(g: GenState): string {
+  return g.type === "active" ? `Gen ${g.gen} (running)` : `Gen ${g.gen}`;
+}
+
+function lifecycleSublabel(g: GenState): string {
+  const prefix = g.type === "active" ? `t${g.turns} $${g.cost.toFixed(2)} - ` : `$${g.cost.toFixed(2)} - `;
+  return fitSublabel(prefix, g.goal);
 }
 
 function emptyLifecycle(): { states: LifecycleState[]; transitions: Transition[] } {
@@ -269,7 +301,7 @@ function buildLifecycleStates(gens: GenState[]): { states: LifecycleState[]; tra
   const promotedCount = gens.filter((g) => g.type === "success").length;
   const totalCost = gens.reduce((s, g) => s + g.cost, 0);
   const states: LifecycleState[] = shown.map((g, col) => ({
-    id: `gen${g.gen}`, type: g.type, label: `Gen ${g.gen}`, sublabel: `$${g.cost.toFixed(2)} - ${g.goal}`, lane: "main", col,
+    id: `gen${g.gen}`, type: g.type, label: lifecycleLabel(g), sublabel: lifecycleSublabel(g), lane: "main", col,
   }));
   const summarySublabel = `${gens.length} gens, ${promotedCount} promoted, $${totalCost.toFixed(2)}` + (omitted > 0 ? ` (${omitted} earlier omitted)` : "");
   states.push({ id: "summary", type: "neutral", label: "Summary", sublabel: summarySublabel, lane: "main", col: states.length });

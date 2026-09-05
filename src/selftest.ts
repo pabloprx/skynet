@@ -9,7 +9,7 @@ import { agentLoop } from "./agent.ts";
 import { chat } from "./providers/index.ts";
 import { gate, disallowedDiffFiles, diffHasSymlink } from "./gate.ts";
 import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag } from "./evolve.ts";
-import { appendTrace, readTraceFiles } from "./trace.ts";
+import { appendTrace, readTraceFiles, genSummaries } from "./trace.ts";
 import { buildArchitectureIR, buildLifecycleIR } from "./ui/ir.ts";
 
 const assert = (c: unknown, m: string) => { if (!c) throw new Error("selftest: " + m); };
@@ -212,10 +212,46 @@ async function testUi(scratch: string) {
   appendTrace(1, "promoted", { cost: 0.02 }, trDir);
   const files = readTraceFiles(trDir);
   assert(files.length === 1 && files[0]!.events.length === 2, "trace: append/read round-trip");
+
+  // a still-running gen (start + turn events, no promoted/rejected) with a 300-char goal: exercises
+  // both the "turn" trace event and the lifecycle sublabel-overflow fix in the same case.
+  const longGoal = "x".repeat(300);
+  appendTrace(2, "start", { goal: longGoal }, trDir);
+  appendTrace(2, "turn", { turn: 1, cost: 0.1 }, trDir);
+  appendTrace(2, "turn", { turn: 2, cost: 0.2 }, trDir);
+  appendTrace(2, "turn", { turn: 3, cost: 0.3 }, trDir);
+
+  const summaries = genSummaries(trDir);
+  assert(summaries.length === 2, `genSummaries: one row per gen (got ${summaries.length})`);
+  const gen2 = summaries.find((s) => s.gen === 2)!;
+  assert(gen2.status === "running" && gen2.turns === 3 && gen2.cost === 0.3, `genSummaries: gen 2 running (turn 3), cost 0.3 (got ${JSON.stringify(gen2)})`);
+  const gen1 = summaries.find((s) => s.gen === 1)!;
+  assert(gen1.status === "promoted" && gen1.cost === 0.02, `genSummaries: gen 1 promoted, cost 0.02 (got ${JSON.stringify(gen1)})`);
+
   const life = buildLifecycleIR(trDir);
-  assert(life.states.length === 2, `buildLifecycleIR has 2 gen stages (got ${life.states.length})`);
+  assert(life.states.length === 3, `buildLifecycleIR has 3 gen stages incl. summary (got ${life.states.length})`);
+  const runningState = life.states.find((s) => s.id === "gen2")!;
+  assert(runningState.type === "active" && runningState.label.includes("running"), `lifecycle: running gen has a distinct label (got ${JSON.stringify(runningState)})`);
+  assert(runningState.sublabel.length <= 30, `lifecycle: sublabel fits archify's legible-minimum budget (got ${runningState.sublabel.length} chars: "${runningState.sublabel}")`);
 
   await testArchifyRender(scratch, arch, life);
+}
+
+async function testUiServer() {
+  const { startServer, maybeStartUi, DEFAULT_UI_PORT } = await import("./ui/server.ts");
+  const s = startServer(0);
+  try {
+    assert(typeof s.port === "number" && s.port > 0, `startServer binds an ephemeral port (got ${s.port})`);
+    await withEnv({ SKYNET_UI_PORT: String(s.port) }, async () => {
+      maybeStartUi(true); // port already taken -> must report the URL without throwing
+    });
+    await withEnv({ SKYNET_CHILD: "1" }, async () => {
+      maybeStartUi(true); // child guard -> no-op, must not throw
+    });
+    assert(DEFAULT_UI_PORT === 3333, `default UI port is 3333 (got ${DEFAULT_UI_PORT})`);
+  } finally {
+    s.stop(true);
+  }
 }
 
 // gate: offline test against throwaway clones under tmpdir, calling gate() directly - never
@@ -280,6 +316,7 @@ export async function selftest() {
   testGateRules();
   await testGuards();
   await testUi(scratch);
+  await testUiServer();
   // only at the top level: gate() itself calls `bun skynet.ts --selftest` on its child (one level
   // of recursion, always has), and that nested selftest run would hit this same block again if it
   // weren't gated on DEPTH - bounding it to one level, not a recursion that grows with DEPTH.

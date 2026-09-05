@@ -3,22 +3,26 @@ import { learn } from "./memory.ts";
 import { gate } from "./gate.ts";
 import { prepareChild, promote, parseBudgetFlag } from "./evolve.ts";
 import { appendTrace } from "./trace.ts";
+import { maybeStartUi } from "./ui/server.ts";
 
 // ---------- adopt: pull another skynet's code through the same gate ----------
 export function parseAdoptFlags(argv: string[]) {
   const flags = [...argv];
   const url = flags.shift();
   if (!url) throw new Error("adopt requires a git-url");
+  const noUi = flags.includes("--no-ui");
+  if (noUi) flags.splice(flags.indexOf("--no-ui"), 1);
   const ri = flags.indexOf("--ref");
   const ref = ri >= 0 ? flags.splice(ri, 2)[1]! : "main";
-  return { url, ref, budget: parseBudgetFlag(flags) };
+  return { url, ref, budget: parseBudgetFlag(flags), noUi };
 }
 
 // ponytail: budget is accepted for CLI parity with evolve but unused - adopt makes no LLM call
 // (cost is 0 unless SKYNET_REVIEW_MODEL is set, and gate()'s diff review isn't budget-metered
 // for evolve either). Add real metering here if a paid review model regularly runs on adopt.
-export async function adopt(url: string, ref: string, _budget: number) {
+export async function adopt(url: string, ref: string, _budget: number, noUi = false) {
   if (process.env.SKYNET_CHILD) throw new Error("adopt: refusing to run recursively inside a child (SKYNET_CHILD is set)");
+  maybeStartUi(!noUi);
   const { n, child } = await prepareChild();
 
   const goal = `adopt ${url}`;
