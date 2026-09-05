@@ -112,6 +112,15 @@ gate:
   diff directly, no LLM involved:
   `bun skynet.ts adopt https://github.com/example/skynet --ref some-branch`.
 
+## Providers
+
+`SKYNET_PROVIDER` picks who serves the LLM calls:
+- `openrouter` (default) - OpenRouter, model default `z-ai/glm-5.3-flash`, needs `OPENROUTER_KEY`.
+- `ollama` - Ollama Cloud (OpenAI-compatible), model default `qwen3-coder:480b`, needs
+  `OLLAMA_API_KEY` (`OLLAMA_URL` defaults to `https://ollama.com/v1`). Ollama reports no cost, so
+  cost is always $0 and `--budget` can't cap spend - only `--max-turns` bounds an ollama run.
+- `claude` - shells out to the local `claude` CLI instead of an HTTP API.
+
 ## Environment variables
 
 | Variable | Purpose |

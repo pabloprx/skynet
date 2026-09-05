@@ -1,6 +1,6 @@
 import type { ChatMessages, ChatToolCall } from "@openrouter/sdk/models";
 import { basename } from "path";
-import { MODEL, MEMORY } from "./config.ts";
+import { MODEL, MEMORY, provider } from "./config.ts";
 import { sh, clone, detectTestCmd } from "./shell.ts";
 import { parseToolCmd, isBlockedCmd } from "./tools.ts";
 import { recall, learn } from "./memory.ts";
@@ -53,6 +53,7 @@ export async function agentLoop(
   childEnv?: Record<string, string>,
 ) {
   if (useClaude()) return claudeRun(dir, system, user, maxTurns, maxCost, childEnv);
+  if (provider() === "ollama") console.log("ollama: no cost reporting, budget caps by turns only");
   const messages: ChatMessages[] = [
     { role: "system", content: [{ type: "text", text: system, cacheControl: { type: "ephemeral" } }] },
     { role: "user", content: user },
@@ -60,7 +61,7 @@ export async function agentLoop(
   let totalCost = 0;
 
   for (let turn = 0; turn < maxTurns; turn++) {
-    const { msg, usage } = await chat(MODEL, messages, [bashTool]);
+    const { msg, usage } = await chat(MODEL(), messages, [bashTool]);
     totalCost += logUsage(turn, usage);
     if (totalCost > maxCost) {
       console.log(`budget exceeded: $${totalCost.toFixed(6)} > $${maxCost.toFixed(6)}, stopping`);

@@ -1,11 +1,12 @@
 import { mkdirSync, chmodSync } from "fs";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
-import { ROOT, DEPTH, VERSION } from "./config.ts";
+import { ROOT, DEPTH, VERSION, MODEL } from "./config.ts";
 import { sh, clone, detectTestCmd } from "./shell.ts";
 import { learn, recall } from "./memory.ts";
 import { parseToolCmd, isBlockedCmd } from "./tools.ts";
 import { agentLoop } from "./agent.ts";
+import { chat } from "./providers/index.ts";
 import { gate, disallowedDiffFiles } from "./gate.ts";
 import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag } from "./evolve.ts";
 
@@ -96,6 +97,46 @@ async function testClaudeProvider(scratch: string, tmp: string) {
   });
 }
 
+async function testOllamaProvider(tmp: string) {
+  const savedKey = process.env.OLLAMA_API_KEY;
+  delete process.env.OLLAMA_API_KEY;
+  try {
+    await withEnv({ SKYNET_PROVIDER: "ollama" }, async () => {
+      let threw = false;
+      try { await chat(MODEL(), [{ role: "user", content: "hi" }]); } catch (e) { threw = String(e).includes("OLLAMA_API_KEY missing"); }
+      assert(threw, "ollama provider throws when OLLAMA_API_KEY is missing");
+    });
+  } finally {
+    if (savedKey !== undefined) process.env.OLLAMA_API_KEY = savedKey;
+  }
+
+  let seenPath = "";
+  let seenAuth = "";
+  const server = Bun.serve({
+    port: 0,
+    fetch(req) {
+      seenPath = new URL(req.url).pathname;
+      seenAuth = req.headers.get("authorization") ?? "";
+      return Response.json({
+        id: "mock", object: "chat.completion", created: 0, model: "qwen3-coder:480b", system_fingerprint: null,
+        choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "LESSON:mock" } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      });
+    },
+  });
+  try {
+    await withEnv({ SKYNET_PROVIDER: "ollama", OLLAMA_API_KEY: "test", OLLAMA_URL: `http://127.0.0.1:${server.port}/v1` }, async () => {
+      const r = await agentLoop(tmp, "sys", "user", 2);
+      assert(r.lesson === "mock", `ollama provider parses mock lesson (got ${r.lesson})`);
+      assert(r.totalCost === 0, `ollama cost stays 0 (got ${r.totalCost})`);
+    });
+  } finally {
+    server.stop(true);
+  }
+  assert(seenPath === "/v1/chat/completions", `ollama request path is /v1/chat/completions (got ${seenPath})`);
+  assert(seenAuth === "Bearer test", `ollama request carries bearer auth (got ${seenAuth})`);
+}
+
 function testGateRules() {
   assert(disallowedDiffFiles(["smoke.test.ts"], "fix bug").length === 1, "smoke.test.ts always disallowed");
   assert(disallowedDiffFiles(["eslint.config.js"], "fix bug").length === 1, "eslint.config.js always disallowed");
@@ -168,6 +209,7 @@ export async function selftest() {
   await testEvolve(scratch);
   testTools();
   await testClaudeProvider(scratch, tmp);
+  await testOllamaProvider(tmp);
   testGateRules();
   await testGuards();
   // only at the top level: gate() itself calls `bun skynet.ts --selftest` on its child (one level

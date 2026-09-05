@@ -85,7 +85,7 @@ async function ensureRepo(dir: string) {
 async function pickGoal(childDir: string) {
   const files = ["skynet.ts", ...new Bun.Glob("src/**/*.ts").scanSync({ cwd: childDir })].sort();
   const src = files.map((f) => `--- ${f} ---\n${readFileSync(join(childDir, f), "utf8")}`).join("\n");
-  const { msg } = await chat(MODEL, [
+  const { msg } = await chat(MODEL(), [
     {
       role: "user",
       content: `You are skynet, choosing your own next self-improvement.\nLessons so far:\n${recall() || "(none)"}\n\nCurrent source (skynet.ts is a thin entry; the code lives in the files under src/):\n${src}\n\nReply with exactly one line: one small, concrete improvement to make to the files under src/.`,
