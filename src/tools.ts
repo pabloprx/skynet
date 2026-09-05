@@ -14,6 +14,9 @@ export function parseToolCmd(raw: string): { cmd: string } | { error: string } {
 // ponytail: heuristic denylist (dir escape, .env, sudo, recursive evolve), not a sandbox.
 // Real containment needs bwrap/firejail/chroot if this matters more. The recursive-evolve
 // clause is belt-and-braces on top of the SKYNET_CHILD guard in evolve()/run().
+// git remote/.git-config are blocked too: the child's own clone metadata would otherwise
+// hand back ROOT's absolute host path (see the origin-remote removal in evolve.ts's
+// prepareChild, which closes the other half of this — the value isn't there to read either).
 export function isBlockedCmd(cmd: string): boolean {
-  return /(^|[\s;&|])cd\s+(\.\.|~|\/)|\.env\b|\bsudo\b|skynet\.ts\s+evolve\b/.test(cmd);
+  return /(^|[\s;&|])cd\s+(\.\.|~|\/)|\.env\b|\bsudo\b|skynet\.ts\s+evolve\b|\.git\/config\b|\bgit\s+remote\b/.test(cmd);
 }

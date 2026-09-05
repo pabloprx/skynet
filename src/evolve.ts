@@ -111,6 +111,10 @@ export async function prepareChild() {
 
   const cl = await sh(`git clone ${JSON.stringify(ROOT)} ${JSON.stringify(child)}`, genRoot, 300_000);
   if (cl.code !== 0) throw new Error(`self-clone failed: ${cl.text}`);
+  // promote() pulls the child's commit into ROOT by path, not by remote — the child never needs
+  // its origin. Drop it so ROOT's absolute host path isn't sitting in the child's .git/config for
+  // an agent's bash tool to read back (see isBlockedCmd's git-remote/.git-config denylist clauses).
+  await sh("git remote remove origin", child);
   return { n, child };
 }
 
@@ -135,7 +139,10 @@ export async function evolve(generations: number, goalArg: string | undefined, m
   if (process.env.SKYNET_CHILD) throw new Error("evolve: refusing to run recursively inside a child (SKYNET_CHILD is set)");
   const { n, child } = await prepareChild();
   if (existsSync(join(ROOT, ".env"))) await Bun.write(join(child, ".env"), readFileSync(join(ROOT, ".env")));
-  const inst = await sh("bun install", child, 300_000);
+  // --ignore-scripts: package.json here is whatever a prior generation promoted — gate() now also
+  // installs with --ignore-scripts (see gate.ts), so a postinstall script must never get a chance
+  // to execute anywhere in the self-modification pipeline, only human-run installs run scripts.
+  const inst = await sh("bun install --ignore-scripts", child, 300_000);
   if (inst.code !== 0) throw new Error(`bun install failed in ${child}: ${inst.text}`);
 
   const goal = goalArg !== undefined ? await resolveGoal(goalArg) : await pickGoal(child);

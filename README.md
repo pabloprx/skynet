@@ -76,16 +76,21 @@ Prints the version string.
 4. Run the clone through the gate, in order:
    1. **no diff** - reject if nothing changed.
    2. **protected files / allowlist** - reject if the diff touches
-      `smoke.test.ts`, `.env`, `.gitignore`, or `CLAUDE.md` (never allowed),
-      or touches anything other than `skynet.ts` (and `package.json`/`bun.lock`,
-      only when the goal itself mentions dependencies).
-   3. **`bun install`** must succeed.
+      `smoke.test.ts`, `.env`, `.gitignore`, `CLAUDE.md`, `eslint.config.js`,
+      or `tsconfig.json` (never allowed), stages a symlink (any path, any
+      target), or touches anything other than `skynet.ts` or a file under
+      `src/` (and `package.json`/`bun.lock`, only when the goal itself
+      mentions dependencies).
+   3. **`bun install --ignore-scripts`** must succeed (lifecycle scripts
+      never run during the gate, even for an allowed `package.json` change).
    4. **`bunx tsc --noEmit`** must succeed.
-   5. **`bun skynet.ts --selftest`** (in the child) must pass.
-   6. **smoke test** - the parent overwrites the child's `smoke.test.ts` with
+   5. **`bunx eslint --no-inline-config .`** must pass (enforces complexity
+      <= 10 per function).
+   6. **`bun skynet.ts --selftest`** (in the child) must pass.
+   7. **smoke test** - the parent overwrites the child's `smoke.test.ts` with
       its own copy first, so the child can't weaken it, then runs
       `bun test smoke.test.ts`.
-   7. **diff review** - if `SKYNET_REVIEW_MODEL` is set, an LLM reviews the
+   8. **diff review** - if `SKYNET_REVIEW_MODEL` is set, an LLM reviews the
       diff against the goal and can still fail the gate.
 5. If the gate passes: commit in the child, fast-forward the parent onto it,
    log a lesson to memory. If it fails: leave the child directory for
@@ -150,7 +155,11 @@ Prints the generation log (gen, event, cost, goal) parsed from
 | `SKYNET_MODEL` | Model for repair/evolve agent loops. Default `z-ai/glm-5.3-flash`. |
 | `SKYNET_HOME` | Working directory for clones, memory, and generations. Default `~/.skynet`. |
 | `SKYNET_REVIEW_MODEL` | If set, model used for the gate's diff review. If unset, diff review is skipped (always passes). |
-| `SKYNET_CHILD` | Internal only. Set by the parent inside a gated child process; do not set this yourself. It disables recursive `evolve`/repair runs. |
+| `SKYNET_PROVIDER` | Who serves LLM calls: `openrouter` (default), `ollama`, or `claude`. See [Providers](#providers). |
+| `OLLAMA_API_KEY` | Required when `SKYNET_PROVIDER=ollama`. |
+| `OLLAMA_URL` | Ollama Cloud endpoint. Default `https://ollama.com/v1`. |
+| `SKYNET_ARCHIFY` | Point `ui`/`ui --build` at an existing archify checkout instead of auto-cloning one into `~/.skynet/archify`. |
+| `SKYNET_CHILD` | Internal only. Set by the parent inside a gated child process; do not set this yourself. It disables recursive `evolve`/repair runs and the `ui` command. |
 
 ## Cost
 

@@ -42,10 +42,8 @@ function sublabelFor(source: string): string {
 
 function scanFiles(root: string): string[] {
   const files = ["skynet.ts"];
-  for (const f of new Bun.Glob("src/**/*.ts").scanSync({ cwd: root })) {
-    if (!f.endsWith(".test.ts")) files.push(f);
-  }
-  return files;
+  const rest = [...new Bun.Glob("src/**/*.ts").scanSync({ cwd: root })].filter((f) => !f.endsWith(".test.ts")).sort();
+  return files.concat(rest);
 }
 
 // ---------- import graph ----------

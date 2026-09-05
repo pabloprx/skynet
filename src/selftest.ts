@@ -7,7 +7,7 @@ import { learn, recall } from "./memory.ts";
 import { parseToolCmd, isBlockedCmd } from "./tools.ts";
 import { agentLoop } from "./agent.ts";
 import { chat } from "./providers/index.ts";
-import { gate, disallowedDiffFiles } from "./gate.ts";
+import { gate, disallowedDiffFiles, diffHasSymlink } from "./gate.ts";
 import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag } from "./evolve.ts";
 import { appendTrace, readTraceFiles } from "./trace.ts";
 import { buildArchitectureIR, buildLifecycleIR } from "./ui/ir.ts";
@@ -78,7 +78,16 @@ function testTools() {
   assert(isBlockedCmd("cd .. && ls"), "denylist blocks cd ..");
   assert(isBlockedCmd("cat .env"), "denylist blocks .env");
   assert(isBlockedCmd("bun skynet.ts evolve --goal x"), "denylist blocks recursive evolve");
+  assert(isBlockedCmd("cat .git/config"), "denylist blocks reading .git/config");
+  assert(isBlockedCmd("git remote get-url origin"), "denylist blocks git remote (ROOT path recovery)");
   assert(!isBlockedCmd("echo hi"), "denylist allows plain commands");
+}
+
+function testDiffHasSymlink() {
+  const noneRaw = ":100644 100644 aaa bbb M\tsrc/foo.ts\n:000000 100644 000 ccc A\tsrc/bar.ts";
+  assert(!diffHasSymlink(noneRaw), "diffHasSymlink: false on plain file changes");
+  const symlinkRaw = ":000000 120000 000 ddd A\tsrc/evil.ts";
+  assert(diffHasSymlink(symlinkRaw), "diffHasSymlink: true when a diff stages a symlink");
 }
 
 async function withEnv(vars: Record<string, string>, fn: () => Promise<void>) {
@@ -245,6 +254,13 @@ async function testGate(scratch: string) {
   await Bun.write(join(uchild, "bunfig.toml"), "[test]\npreload = []\n");
   const untrackedResult = await gate(uchild, 999_003, "harmless comment");
   assert(!untrackedResult.ok && untrackedResult.reason.includes("bunfig.toml"), `gate: untracked root file should reject: ${untrackedResult.reason}`);
+
+  // a symlink under src/ passes the path-only allowlist, so it needs its own dedicated check
+  const schild = join(scratch, "gate-child-symlink");
+  await seedChild(schild);
+  assert((await sh("ln -s ../../../etc/passwd src/evil-link.ts", schild)).code === 0, "gate: create symlink under src/");
+  const symlinkResult = await gate(schild, 999_004, "harmless comment");
+  assert(!symlinkResult.ok && symlinkResult.reason.includes("symlink"), `gate: symlink in diff should reject: ${symlinkResult.reason}`);
 }
 
 // ---------- selftest (offline) ----------
@@ -258,6 +274,7 @@ export async function selftest() {
   testFlags();
   await testEvolve(scratch);
   testTools();
+  testDiffHasSymlink();
   await testClaudeProvider(scratch, tmp);
   await testOllamaProvider(tmp);
   testGateRules();
