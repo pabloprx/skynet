@@ -121,6 +121,27 @@ gate:
   cost is always $0 and `--budget` can't cap spend - only `--max-turns` bounds an ollama run.
 - `claude` - shells out to the local `claude` CLI instead of an HTTP API.
 
+## Web UI
+
+```
+bun skynet.ts ui [--port N] [--build]
+```
+Serves an architecture diagram (module import graph of `src/`) and a
+lifecycle diagram (recent `evolve` generations) as standalone HTML, plus a
+generation log table. Rendering is delegated to
+[archify](https://github.com/tt-a1i/archify) (pinned commit
+`5769acefcc2ebd696a4f9ed3ac9cb6cca1d75c70`), auto-cloned into
+`~/.skynet/archify` on first use - requires `node` on `PATH`. `--port`
+(default 4173) sets the listen port; `--build` renders once to
+`~/.skynet/ui/*.html` and exits instead of serving. Set `SKYNET_ARCHIFY` to
+point at an existing archify checkout to skip the auto-clone.
+
+```
+bun skynet.ts log
+```
+Prints the generation log (gen, event, cost, goal) parsed from
+`~/.skynet/trace/gen-*.jsonl` - same data the web UI's log table shows.
+
 ## Environment variables
 
 | Variable | Purpose |

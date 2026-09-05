@@ -1,4 +1,4 @@
-import { mkdirSync, chmodSync } from "fs";
+import { mkdirSync, chmodSync, existsSync, statSync } from "fs";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
 import { ROOT, DEPTH, VERSION, MODEL } from "./config.ts";
@@ -9,6 +9,8 @@ import { agentLoop } from "./agent.ts";
 import { chat } from "./providers/index.ts";
 import { gate, disallowedDiffFiles } from "./gate.ts";
 import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag } from "./evolve.ts";
+import { appendTrace, readTraceFiles } from "./trace.ts";
+import { buildArchitectureIR, buildLifecycleIR } from "./ui/ir.ts";
 
 const assert = (c: unknown, m: string) => { if (!c) throw new Error("selftest: " + m); };
 
@@ -159,6 +161,54 @@ async function testGuards() {
   assert(r.code !== 0 && r.text.includes("nesting depth exceeded"), "SKYNET_DEPTH>2 refuses to run");
 }
 
+async function testArchifyRender(scratch: string, arch: unknown, life: unknown) {
+  const archifyDir = process.env.SKYNET_ARCHIFY;
+  const cli = archifyDir ? join(archifyDir, "archify", "bin", "archify.mjs") : "";
+  const hasNode = (await sh("node --version", scratch, 10_000)).code === 0;
+  if (!archifyDir || !hasNode || !existsSync(cli)) return void console.log("skip: archify");
+
+  const dir = join(scratch, "ui-render");
+  mkdirSync(dir, { recursive: true });
+  const archJson = join(dir, "architecture.json");
+  const lifeJson = join(dir, "lifecycle.json");
+  await Bun.write(archJson, JSON.stringify(arch));
+  await Bun.write(lifeJson, JSON.stringify(life));
+
+  // "validate architecture" runs the same artifact-check receipt as "deliver" and hits the same
+  // 64KB truncation on this input's many warnings, even on the pristine clone - skip it, "render"
+  // below is what actually needs to work. lifecycle's receipt is small enough to stay validated.
+  const vl = await sh(`node ${JSON.stringify(cli)} validate lifecycle ${JSON.stringify(lifeJson)} --json`, dir, 30_000);
+  assert(vl.code === 0, `archify validate lifecycle exit 0: ${vl.text.slice(-500)}`);
+
+  const archHtml = join(dir, "architecture.html");
+  const lifeHtml = join(dir, "lifecycle.html");
+  const da = await sh(`node ${JSON.stringify(cli)} render architecture ${JSON.stringify(archJson)} ${JSON.stringify(archHtml)} --quality standard`, dir, 30_000);
+  assert(da.code === 0, `archify render architecture exit 0: ${da.text.slice(-500)}`);
+  const dl = await sh(`node ${JSON.stringify(cli)} render lifecycle ${JSON.stringify(lifeJson)} ${JSON.stringify(lifeHtml)} --quality standard`, dir, 30_000);
+  assert(dl.code === 0, `archify render lifecycle exit 0: ${dl.text.slice(-500)}`);
+
+  assert(statSync(archHtml).size > 10_000, "architecture.html > 10KB");
+  assert(statSync(lifeHtml).size > 10_000, "lifecycle.html > 10KB");
+}
+
+async function testUi(scratch: string) {
+  const arch = buildArchitectureIR(ROOT);
+  assert(arch.components.length >= 10, `buildArchitectureIR finds >= 10 components (got ${arch.components.length})`);
+  assert(arch.connections.some((c) => c.from === "src_agent" && c.to === "src_providers_index"), "connection agent.ts -> providers/index.ts exists");
+
+  // SKYNET_HOME is baked into config.ts at import time, so a tmp "home" for this test means an
+  // explicit trace dir passed to the helpers directly, not a process.env mutation (a no-op here).
+  const trDir = join(scratch, "ui-trace-home", "trace");
+  appendTrace(1, "start", { goal: "add cache" }, trDir);
+  appendTrace(1, "promoted", { cost: 0.02 }, trDir);
+  const files = readTraceFiles(trDir);
+  assert(files.length === 1 && files[0]!.events.length === 2, "trace: append/read round-trip");
+  const life = buildLifecycleIR(trDir);
+  assert(life.states.length === 2, `buildLifecycleIR has 2 gen stages (got ${life.states.length})`);
+
+  await testArchifyRender(scratch, arch, life);
+}
+
 // gate: offline test against throwaway clones under tmpdir, calling gate() directly - never
 // spawns `skynet.ts adopt/evolve/run` from inside selftest. That used to recurse unboundedly
 // (selftest -> adopt -> gate -> selftest -> adopt -> ...); SKYNET_DEPTH now also caps gate()'s
@@ -212,6 +262,7 @@ export async function selftest() {
   await testOllamaProvider(tmp);
   testGateRules();
   await testGuards();
+  await testUi(scratch);
   // only at the top level: gate() itself calls `bun skynet.ts --selftest` on its child (one level
   // of recursion, always has), and that nested selftest run would hit this same block again if it
   // weren't gated on DEPTH - bounding it to one level, not a recursion that grows with DEPTH.

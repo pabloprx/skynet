@@ -7,6 +7,7 @@ import { recall, learn } from "./memory.ts";
 import { gate, ALWAYS_PROTECTED_FILES } from "./gate.ts";
 import { agentLoop } from "./agent.ts";
 import { chat } from "./providers/index.ts";
+import { appendTrace } from "./trace.ts";
 
 export function nextGenDir(genRoot: string): number {
   if (!existsSync(genRoot)) return 1;
@@ -139,6 +140,7 @@ export async function evolve(generations: number, goalArg: string | undefined, m
 
   const goal = goalArg !== undefined ? await resolveGoal(goalArg) : await pickGoal(child);
   console.log(`gen ${n} goal: ${goal}`);
+  appendTrace(n, "start", { goal });
 
   const system = `You are skynet, improving your own source at ${child}. Goal: ${goal}.
 Constraints: only edit files inside this directory, never touch .env, keep "bun skynet.ts --selftest", "bunx tsc --noEmit" and "bunx eslint --no-inline-config ." passing, add one selftest assertion covering your change, do not commit.
@@ -156,9 +158,11 @@ When done, reply with exactly one line starting with "LESSON:".`;
     await promote(child, n, goal);
     learn("self", `gen ${n} promoted: ${goal}: ${lesson ?? "(no lesson)"}`);
     console.log(`gen ${n} promoted.`);
+    appendTrace(n, "promoted", { cost: totalCost });
   } else {
     learn("self", `gen ${n} rejected: ${goal}: ${gateResult.reason}`);
     console.log(`gen ${n} rejected (${gateResult.reason}), left at ${child} for inspection.`);
+    appendTrace(n, "rejected", { reason: gateResult.reason, cost: totalCost });
   }
 
   const remaining = generations - 1;
