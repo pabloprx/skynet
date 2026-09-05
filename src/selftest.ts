@@ -1,4 +1,4 @@
-import { mkdirSync, chmodSync, existsSync, statSync } from "fs";
+import { mkdirSync, chmodSync, existsSync, statSync, appendFileSync } from "fs";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
 import { ROOT, DEPTH, VERSION, MODEL } from "./config.ts";
@@ -8,7 +8,9 @@ import { parseToolCmd, isBlockedCmd } from "./tools.ts";
 import { agentLoop } from "./agent.ts";
 import { chat } from "./providers/index.ts";
 import { gate, disallowedDiffFiles, diffHasSymlink } from "./gate.ts";
-import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag } from "./evolve.ts";
+import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag, takeFlagValue } from "./evolve.ts";
+import { parseAdoptFlags } from "./adopt.ts";
+import { parseRunFlags } from "./cli.ts";
 import { appendTrace, readTraceFiles, genSummaries } from "./trace.ts";
 import { buildArchitectureIR, buildLifecycleIR } from "./ui/ir.ts";
 
@@ -50,6 +52,22 @@ function testFlags() {
   assert(f2.generations === 5 && f2.goal === "x y" && f2.maxTurns === 7 && f2.budget === 0.2, "parseEvolveFlags overrides");
   assert(["0", "-1", "nope", "Infinity"].every((n) => { try { parsePositiveIntegerFlag("--max-turns", n); return false; } catch { return true; } }), "numeric flags reject invalid values");
   assert(["0", "-1", "nope"].every((n) => { try { parseEvolveFlags(["--budget", n]); return false; } catch { return true; } }), "--budget rejects invalid values");
+  // a bare `--goal`/`--ref` used to silently yield undefined: evolve fell through to pickGoal's
+  // paid auto-goal LLM call, adopt ran `git pull <url> undefined` and misreported it as a
+  // conflict. takeFlagValue must fail fast with "<name> requires a value" instead.
+  assert(["--goal", "--ref"].every((f) => { try { takeFlagValue([f], f); return false; } catch (e) { return String(e).includes(`${f} requires a value`); } }), "takeFlagValue rejects a missing flag value");
+  assert((() => { try { parseEvolveFlags(["--goal"]); return false; } catch (e) { return String(e).includes("--goal requires a value"); } })(), "parseEvolveFlags throws on bare --goal");
+  assert((() => { try { parseAdoptFlags(["u", "--ref"]); return false; } catch (e) { return String(e).includes("--ref requires a value"); } })(), "parseAdoptFlags throws on bare --ref");
+  // a flag-only run like `bun skynet.ts --max-turns 5` used to splice the flag out and leave
+  // run(args[0]!) with undefined, crashing deep inside clone()'s existsSync with a confusing
+  // TypeError - parseRunFlags must parse target/max-turns and fail fast when no target remains.
+  assert((() => {
+    const pf = parseRunFlags(["/tmp/repo", "--max-turns", "7"]);
+    if (pf.target !== "/tmp/repo" || pf.maxTurns !== 7) return false;
+    try { parseRunFlags(["--max-turns", "5"]); return false; }
+    catch (e) { return String(e).includes("run requires a git-url or path"); }
+  })(), "parseRunFlags parses target/--max-turns and rejects a missing target");
+  assert(takeFlagValue(["--goal", "x"], "--goal") === "x" && takeFlagValue([], "--goal") === undefined, "takeFlagValue passthrough and absent cases");
 }
 
 async function testEvolve(scratch: string) {
@@ -200,11 +218,10 @@ async function testArchifyRender(scratch: string, arch: unknown, life: unknown) 
   assert(statSync(lifeHtml).size > 10_000, "lifecycle.html > 10KB");
 }
 
-async function testUi(scratch: string) {
-  const arch = buildArchitectureIR(ROOT);
-  assert(arch.components.length >= 10, `buildArchitectureIR finds >= 10 components (got ${arch.components.length})`);
-  assert(arch.connections.some((c) => c.from === "src_agent" && c.to === "src_providers_index"), "connection agent.ts -> providers/index.ts exists");
-
+// trace-level half of the ui selftest: seeds a tmp trace dir with one promoted, one running, two
+// killed generations plus a torn line, and checks genSummaries reads all four back. Split out of
+// testUi purely to keep both halves under the eslint `complexity` gate.
+function testTrace(scratch: string): string {
   // SKYNET_HOME is baked into config.ts at import time, so a tmp "home" for this test means an
   // explicit trace dir passed to the helpers directly, not a process.env mutation (a no-op here).
   const trDir = join(scratch, "ui-trace-home", "trace");
@@ -212,6 +229,10 @@ async function testUi(scratch: string) {
   appendTrace(1, "promoted", { cost: 0.02 }, trDir);
   const files = readTraceFiles(trDir);
   assert(files.length === 1 && files[0]!.events.length === 2, "trace: append/read round-trip");
+  // a trace write is telemetry, never a reason to abort a generation: gate()/the per-turn hook
+  // call this mid-run, so an unwritable trace dir (here: a path whose parent is a file) must warn
+  // rather than throw.
+  appendTrace(1, "start", {}, join(trDir, "gen-1.jsonl", "nested"));
 
   // a still-running gen (start + turn events, no promoted/rejected) with a 300-char goal: exercises
   // both the "turn" trace event and the lifecycle sublabel-overflow fix in the same case.
@@ -223,12 +244,28 @@ async function testUi(scratch: string) {
   appendTrace(2, "turn", { turn: 2, cost: 0.2 }, trDir);
   appendTrace(2, "turn", { turn: 3, cost: 0.3 }, trDir);
 
+  // simulate a hard kill (SIGINT) mid-appendFileSync: the torn final line used to make
+  // readTraceFiles/genSummaries/buildLifecycleIR throw forever until the file was hand-deleted.
+  const gen2File = join(trDir, "gen-2.jsonl");
+  const gen2EventsBefore = readTraceFiles(trDir).find((f) => f.gen === 2)!.events.length;
+  // torn line exactly as a hard kill mid-append would leave it: valid prefix, no closing brace
+  appendFileSync(gen2File, '{"t":"' + new Date().toISOString() + ',"gen":2,"event":"turn"\n');
+  const tornFiles = readTraceFiles(trDir);
+  const gen2After = tornFiles.find((f) => f.gen === 2)!.events;
+  assert(tornFiles.length === 2 && gen2After.length === gen2EventsBefore && gen2After.every((e) => typeof e === "object" && e !== null), "trace: torn final line skipped, only well-formed events returned");
+  const tornSummaries = genSummaries(trDir);
+  assert(tornSummaries.length === 2 && tornSummaries.every((g) => g.status === "running" || g.status === "promoted" || g.status === "rejected"), "genSummaries: survives a torn final trace line without throwing");
+
   // a "start" event whose pid is provably dead (no terminal event either) - the stale/killed
-  // detection this task added: 999999 is never a live pid on this box.
+  // detection this task added: 999999/999998 are never live pids on this box. Two of them, not
+  // one: the killed gens share archify's middle event band, whose adjacent columns sit 28px
+  // apart - under the renderer's 32px minimum - so a second killed gen is what proves
+  // buildLifecycleIR doesn't chain them into a transition archify rejects outright.
   appendTrace(3, "start", { goal: "dead process", pid: 999999 }, trDir);
+  appendTrace(4, "start", { goal: "another dead process", pid: 999998 }, trDir);
 
   const summaries = genSummaries(trDir);
-  assert(summaries.length === 3, `genSummaries: one row per gen (got ${summaries.length})`);
+  assert(summaries.length === 4, `genSummaries: one row per gen (got ${summaries.length})`);
   const gen2 = summaries.find((s) => s.gen === 2)!;
   assert(gen2.status === "running" && gen2.turns === 3 && gen2.cost === 0.3, `genSummaries: gen 2 running (turn 3), cost 0.3 (got ${JSON.stringify(gen2)})`);
   const gen1 = summaries.find((s) => s.gen === 1)!;
@@ -236,13 +273,28 @@ async function testUi(scratch: string) {
   const gen3 = summaries.find((s) => s.gen === 3)!;
   assert(gen3.status === "killed", `genSummaries: gen 3 killed (dead pid, no terminal event) (got ${JSON.stringify(gen3)})`);
 
+  return trDir;
+}
+
+async function testUi(scratch: string) {
+  const arch = buildArchitectureIR(ROOT);
+  assert(arch.components.length >= 10, `buildArchitectureIR finds >= 10 components (got ${arch.components.length})`);
+  assert(arch.connections.some((c) => c.from === "src_agent" && c.to === "src_providers_index"), "connection agent.ts -> providers/index.ts exists");
+
+  const trDir = testTrace(scratch);
+
   const life = buildLifecycleIR(trDir);
-  assert(life.states.length === 4, `buildLifecycleIR has 4 gen stages incl. summary (got ${life.states.length})`);
+  assert(life.states.length === 5, `buildLifecycleIR has 5 gen stages incl. summary (got ${life.states.length})`);
   const runningState = life.states.find((s) => s.id === "gen2")!;
   assert(runningState.type === "active" && runningState.label.includes("running") && runningState.lane === "main", `lifecycle: running gen has a distinct label and main lane (got ${JSON.stringify(runningState)})`);
   assert(runningState.sublabel.length <= 30, `lifecycle: sublabel fits archify's legible-minimum budget (got ${runningState.sublabel.length} chars: "${runningState.sublabel}")`);
   const killedState = life.states.find((s) => s.id === "gen3")!;
   assert(killedState.type === "failure" && killedState.lane === "events", `lifecycle: killed gen lands in the events lane (got ${JSON.stringify(killedState)})`);
+  // archify's event band is 154px per column against a 126px state width: 28px between adjacent
+  // states, below its 32px transition minimum, so any edge between two of them fails the render
+  // outright (the whole /lifecycle.html page 500s). testArchifyRender below is what catches a
+  // regression here; this assertion just names the rule.
+  assert(!life.transitions.some((t) => t.from === "gen3" && t.to === "gen4"), "lifecycle: killed gens are not chained (event band columns are 28px apart, under archify's 32px edge minimum)");
 
   await testArchifyRender(scratch, arch, life);
 }
@@ -278,6 +330,9 @@ async function seedChild(dir: string) {
 }
 
 async function testGate(scratch: string) {
+  // gate() traces its stage boundaries; this selftest runs in the human's real HOME, so point it
+  // at a scratch trace dir or every `--selftest` leaves phantom 999xxx "killed" gens in the log.
+  const gateTrace = join(scratch, "gate-trace");
   const lint = await sh("bunx eslint --no-inline-config .", ROOT, 120_000);
   assert(lint.code === 0, `eslint clean: ${lint.text.slice(-500)}`);
 
@@ -285,27 +340,28 @@ async function testGate(scratch: string) {
   await seedChild(gchild);
   assert((await sh(`ln -s ${JSON.stringify(join(ROOT, "node_modules"))} ${JSON.stringify(join(gchild, "node_modules"))}`, scratch)).code === 0, "gate: link node_modules");
   await sh(`echo '// gate-selftest: harmless' >> skynet.ts`, gchild);
-  const okResult = await gate(gchild, 999_001, "harmless comment");
+  const okResult = await gate(gchild, 999_001, "harmless comment", gateTrace);
   assert(okResult.ok, `gate: harmless diff should pass: ${okResult.reason}`);
+  assert(existsSync(join(gateTrace, "gen-999001.jsonl")), "gate: stage trace lands in the caller's trace dir, not the human's HOME");
 
   const bchild = join(scratch, "gate-child-bad");
   await seedChild(bchild);
   await sh(`echo '// gate-selftest: bad' >> smoke.test.ts`, bchild);
-  const badResult = await gate(bchild, 999_002, "harmless comment");
+  const badResult = await gate(bchild, 999_002, "harmless comment", gateTrace);
   assert(!badResult.ok && badResult.reason.includes("touched disallowed files"), `gate: touching smoke.test.ts should reject: ${badResult.reason}`);
 
   // untracked files must be visible to the allowlist (plain `git diff` would miss them)
   const uchild = join(scratch, "gate-child-untracked");
   await seedChild(uchild);
   await Bun.write(join(uchild, "bunfig.toml"), "[test]\npreload = []\n");
-  const untrackedResult = await gate(uchild, 999_003, "harmless comment");
+  const untrackedResult = await gate(uchild, 999_003, "harmless comment", gateTrace);
   assert(!untrackedResult.ok && untrackedResult.reason.includes("bunfig.toml"), `gate: untracked root file should reject: ${untrackedResult.reason}`);
 
   // a symlink under src/ passes the path-only allowlist, so it needs its own dedicated check
   const schild = join(scratch, "gate-child-symlink");
   await seedChild(schild);
   assert((await sh("ln -s ../../../etc/passwd src/evil-link.ts", schild)).code === 0, "gate: create symlink under src/");
-  const symlinkResult = await gate(schild, 999_004, "harmless comment");
+  const symlinkResult = await gate(schild, 999_004, "harmless comment", gateTrace);
   assert(!symlinkResult.ok && symlinkResult.reason.includes("symlink"), `gate: symlink in diff should reject: ${symlinkResult.reason}`);
 }
 

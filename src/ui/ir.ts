@@ -303,7 +303,10 @@ function emptyLifecycle(): { states: LifecycleState[]; transitions: Transition[]
 }
 
 // chains consecutive states within one lane in gen order, so the map still reads as a history
-// (gen 12 -> gen 13 -> gen 14) rather than a scatter of disconnected boxes.
+// (gen 12 -> gen 13 -> gen 14) rather than a scatter of disconnected boxes. Only ever called for
+// the phase ("main") and outcome ("terminal") bands: archify spaces those 154px apart against a
+// 118px state, leaving a 36px edge, but its event band uses a 126px state - 28px, under the
+// renderer's 32px transition minimum, so chaining there fails the whole render.
 function chainLane(states: LifecycleState[], lane: Lane): Transition[] {
   const laneStates = states.filter((s) => s.lane === lane);
   return laneStates.slice(1).map((s, i) => ({ id: `${laneStates[i]!.id}-${s.id}`, from: laneStates[i]!.id, to: s.id }));
@@ -329,7 +332,7 @@ function buildLifecycleStates(gens: GenSummary[]): { states: LifecycleState[]; t
   const summarySublabel = fitSublabel("", `${gens.length} gens, ${promotedCount} promoted, ${fmtCost(totalCost)}` + (omitted > 0 ? ` (${omitted} more)` : ""));
   states.push({ id: "summary", type: "neutral", label: "Summary", sublabel: summarySublabel, lane: "terminal", col: settled.length });
 
-  const transitions: Transition[] = [...chainLane(states, "main"), ...chainLane(states, "events"), ...chainLane(states, "terminal")];
+  const transitions: Transition[] = [...chainLane(states, "main"), ...chainLane(states, "terminal")];
   return { states, transitions };
 }
 

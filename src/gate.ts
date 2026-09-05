@@ -54,7 +54,12 @@ async function diffReview(child: string, goal: string): Promise<{ pass: boolean;
 // order: no-diff -> protected/allowlist -> symlink check -> install -> tsc -> lint -> selftest -> smoke (parent's copy) -> diff review
 // stage everything first: plain `git diff` misses untracked and staged-only files, which promote()'s
 // `git add -A` would then commit unseen by the allowlist and the diff review.
-export async function gate(child: string, n: number, goal: string): Promise<{ ok: boolean; reason: string }> {
+// trDir: gate() traces its own stage boundaries, and the selftest calls gate() directly from the
+// human's real HOME - so the dir is the caller's to name (evolve/adopt pass traceDir()), not a
+// default. Without that, every `--selftest` run appended phantom generations (999001+) to
+// ~/.skynet/trace that the log and lifecycle map then showed as "killed" forever. Required, not
+// optional, because eslint's `complexity` rule counts a default parameter as a branch.
+export async function gate(child: string, n: number, goal: string, trDir: string): Promise<{ ok: boolean; reason: string }> {
   await sh("git add -A", child);
   const diffStat = await sh("git diff --cached --stat", child);
   if (!diffStat.text.trim()) return { ok: false, reason: "no diff produced" };
@@ -69,29 +74,29 @@ export async function gate(child: string, n: number, goal: string): Promise<{ ok
   // --ignore-scripts: an attacker who slips a "dependency" goal past disallowedDiffFiles could
   // otherwise plant a package.json postinstall and have it run right here, at full host privilege,
   // before any other check gets a vote (including on a generation the later checks go on to reject).
-  appendTrace(n, "stage", { stage: "gate:install" });
+  appendTrace(n, "stage", { stage: "gate:install" }, trDir);
   const inst = await sh("bun install --ignore-scripts", child, 300_000);
   if (inst.code !== 0) return { ok: false, reason: `bun install failed: ${inst.text.slice(-500)}` };
 
-  appendTrace(n, "stage", { stage: "gate:tsc" });
+  appendTrace(n, "stage", { stage: "gate:tsc" }, trDir);
   const tsc = await sh("bunx tsc --noEmit", child, 120_000);
   if (tsc.code !== 0) return { ok: false, reason: `tsc failed: ${tsc.text.slice(-500)}` };
 
-  appendTrace(n, "stage", { stage: "gate:lint" });
+  appendTrace(n, "stage", { stage: "gate:lint" }, trDir);
   const lint = await sh("bunx eslint --no-inline-config .", child, 120_000);
   if (lint.code !== 0) return { ok: false, reason: `lint failed: ${lint.text.slice(-500)}` };
 
-  appendTrace(n, "stage", { stage: "gate:selftest" });
+  appendTrace(n, "stage", { stage: "gate:selftest" }, trDir);
   const st = await sh(`SKYNET_HOME=${JSON.stringify(join(tmpdir(), `skynet-gate-selftest-${n}-${Date.now()}`))} SKYNET_DEPTH=${DEPTH + 1} bun skynet.ts --selftest`, child, 60_000);
   if (st.code !== 0) return { ok: false, reason: `selftest failed: ${st.text.slice(-500)}` };
 
   // parent copies its own smoke test over whatever the child left, so the child can't weaken it
-  appendTrace(n, "stage", { stage: "gate:smoke" });
+  appendTrace(n, "stage", { stage: "gate:smoke" }, trDir);
   await Bun.write(join(child, "smoke.test.ts"), readFileSync(join(ROOT, "smoke.test.ts")));
   const smoke = await sh(`SKYNET_HOME=${JSON.stringify(join(tmpdir(), `skynet-gate-smoke-${n}-${Date.now()}`))} SKYNET_DEPTH=${DEPTH + 1} bun test smoke.test.ts`, child, 120_000);
   if (smoke.code !== 0) return { ok: false, reason: `smoke test failed: ${smoke.text.slice(-500)}` };
 
-  appendTrace(n, "stage", { stage: "gate:review" });
+  appendTrace(n, "stage", { stage: "gate:review" }, trDir);
   const review = await diffReview(child, goal);
   if (!review.pass) return { ok: false, reason: `diff review: ${review.reason}` };
 

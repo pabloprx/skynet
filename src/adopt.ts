@@ -1,8 +1,8 @@
 import { sh } from "./shell.ts";
 import { learn } from "./memory.ts";
 import { gate } from "./gate.ts";
-import { prepareChild, promote, parseBudgetFlag } from "./evolve.ts";
-import { appendTrace } from "./trace.ts";
+import { prepareChild, promote, parseBudgetFlag, takeFlagValue } from "./evolve.ts";
+import { appendTrace, traceDir } from "./trace.ts";
 import { maybeStartUi } from "./ui/server.ts";
 
 // ---------- adopt: pull another skynet's code through the same gate ----------
@@ -12,8 +12,7 @@ export function parseAdoptFlags(argv: string[]) {
   if (!url) throw new Error("adopt requires a git-url");
   const noUi = flags.includes("--no-ui");
   if (noUi) flags.splice(flags.indexOf("--no-ui"), 1);
-  const ri = flags.indexOf("--ref");
-  const ref = ri >= 0 ? flags.splice(ri, 2)[1]! : "main";
+  const ref = takeFlagValue(flags, "--ref") ?? "main";
   return { url, ref, budget: parseBudgetFlag(flags), noUi };
 }
 
@@ -43,7 +42,7 @@ export async function adopt(url: string, ref: string, _budget: number, noUi = fa
     const afterSha = (await sh("git rev-parse HEAD", child)).text.trim();
     if (afterSha !== beforeSha) await sh(`git reset ${beforeSha}`, child);
     appendTrace(n, "stage", { stage: "gate" });
-    gateResult = await gate(child, n, goal);
+    gateResult = await gate(child, n, goal, traceDir());
   }
 
   if (gateResult.ok) {

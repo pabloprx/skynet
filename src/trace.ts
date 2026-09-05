@@ -23,10 +23,32 @@ export interface TraceEvent {
 
 // dir param (default HOME/trace) lets tests point at a tmp dir without relying on mutating
 // process.env - HOME in config.ts is a module-load const, so an env mutation after import is a no-op.
+// telemetry must never be able to abort a generation: this is now called from every stage
+// boundary, from inside gate() and from the agent's per-turn hook, so a read-only/full trace dir
+// would otherwise throw straight out of an otherwise-healthy run. Warn and carry on instead.
 export function appendTrace(gen: number, event: string, extra: Record<string, unknown> = {}, dir: string = traceDir()) {
-  mkdirSync(dir, { recursive: true });
-  const line: TraceEvent = { t: new Date().toISOString(), gen, event, ...extra };
-  appendFileSync(join(dir, `gen-${gen}.jsonl`), JSON.stringify(line) + "\n");
+  try {
+    mkdirSync(dir, { recursive: true });
+    const line: TraceEvent = { t: new Date().toISOString(), gen, event, ...extra };
+    appendFileSync(join(dir, `gen-${gen}.jsonl`), JSON.stringify(line) + "\n");
+  } catch (e) {
+    console.error(`skynet: trace write failed (gen ${gen}, ${event}): ${String(e)}`);
+  }
+}
+
+// appendFileSync isn't atomic: a hard kill (e.g. SIGINT) mid-append leaves a torn final line like
+// `{"t":"2026-...` in the jsonl. Without this guard, that one line makes every later `skynet.ts
+// log` / genSummaries / ui buildLifecycleIR throw forever until the file is hand-deleted - so
+// parse defensively and skip malformed lines, warning once per skipped line on stderr.
+function parseTraceLine(line: string, file: string): TraceEvent | undefined {
+  try {
+    const parsed: unknown = JSON.parse(line);
+    if (typeof parsed === "object" && parsed !== null) return parsed as TraceEvent;
+  } catch {
+    // torn/truncated line (or plain non-JSON garbage) -> warn once and skip
+  }
+  console.error(`skynet: skipping malformed trace line in ${file}`);
+  return undefined;
 }
 
 export function readTraceFiles(dir: string = traceDir()): { gen: number; events: TraceEvent[] }[] {
@@ -36,13 +58,17 @@ export function readTraceFiles(dir: string = traceDir()): { gen: number; events:
     .filter((m): m is RegExpMatchArray => m !== null)
     .map((m) => Number(m[1]))
     .sort((a, b) => a - b);
-  return gens.map((gen) => ({
-    gen,
-    events: readFileSync(join(dir, `gen-${gen}.jsonl`), "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => JSON.parse(l) as TraceEvent),
-  }));
+  return gens.map((gen) => {
+    const file = `gen-${gen}.jsonl`;
+    return {
+      gen,
+      events: readFileSync(join(dir, file), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => parseTraceLine(l, file))
+        .filter((e): e is TraceEvent => e !== undefined),
+    };
+  });
 }
 
 // $ and duration formatting shared by the CLI log, the ui table and the lifecycle map, so the
