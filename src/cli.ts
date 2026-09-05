@@ -11,10 +11,21 @@ function fail(e: unknown): never {
   process.exit(1);
 }
 
+// a flag-only invocation like `bun skynet.ts --max-turns 5` used to splice the flag out and call
+// run(args[0]!) with undefined, crashing deep inside clone()'s existsSync with a confusing
+// TypeError - mirror parseAdoptFlags and fail fast with a clear message when no target remains.
+export function parseRunFlags(argv: string[]) {
+  const flags = [...argv];
+  const mt = flags.indexOf("--max-turns");
+  const maxTurns = mt >= 0 ? parsePositiveIntegerFlag("--max-turns", flags.splice(mt, 2)[1]) : 25;
+  const target = flags.shift();
+  if (!target) throw new Error("run requires a git-url or path");
+  return { target, maxTurns };
+}
+
 async function runCmd(args: string[]) {
-  const mt = args.indexOf("--max-turns");
-  const maxTurns = mt >= 0 ? parsePositiveIntegerFlag("--max-turns", args.splice(mt, 2)[1]) : 25;
-  await run(args[0]!, maxTurns);
+  const { target, maxTurns } = parseRunFlags(args);
+  await run(target, maxTurns);
 }
 
 async function runSubcommand(cmd: string, rest: string[]) {

@@ -10,6 +10,7 @@ import { chat } from "./providers/index.ts";
 import { gate, disallowedDiffFiles, diffHasSymlink } from "./gate.ts";
 import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag, takeFlagValue } from "./evolve.ts";
 import { parseAdoptFlags } from "./adopt.ts";
+import { parseRunFlags } from "./cli.ts";
 import { appendTrace, readTraceFiles, genSummaries } from "./trace.ts";
 import { buildArchitectureIR, buildLifecycleIR } from "./ui/ir.ts";
 
@@ -57,6 +58,15 @@ function testFlags() {
   assert(["--goal", "--ref"].every((f) => { try { takeFlagValue([f], f); return false; } catch (e) { return String(e).includes(`${f} requires a value`); } }), "takeFlagValue rejects a missing flag value");
   assert((() => { try { parseEvolveFlags(["--goal"]); return false; } catch (e) { return String(e).includes("--goal requires a value"); } })(), "parseEvolveFlags throws on bare --goal");
   assert((() => { try { parseAdoptFlags(["u", "--ref"]); return false; } catch (e) { return String(e).includes("--ref requires a value"); } })(), "parseAdoptFlags throws on bare --ref");
+  // a flag-only run like `bun skynet.ts --max-turns 5` used to splice the flag out and leave
+  // run(args[0]!) with undefined, crashing deep inside clone()'s existsSync with a confusing
+  // TypeError - parseRunFlags must parse target/max-turns and fail fast when no target remains.
+  assert((() => {
+    const pf = parseRunFlags(["/tmp/repo", "--max-turns", "7"]);
+    if (pf.target !== "/tmp/repo" || pf.maxTurns !== 7) return false;
+    try { parseRunFlags(["--max-turns", "5"]); return false; }
+    catch (e) { return String(e).includes("run requires a git-url or path"); }
+  })(), "parseRunFlags parses target/--max-turns and rejects a missing target");
   assert(takeFlagValue(["--goal", "x"], "--goal") === "x" && takeFlagValue([], "--goal") === undefined, "takeFlagValue passthrough and absent cases");
 }
 
