@@ -2,7 +2,7 @@
 // pinned archify CLI and serves them alongside the generation log. See CLAUDE.md / README "Web UI".
 import { existsSync, mkdirSync, statSync, readdirSync } from "fs";
 import { join } from "path";
-import { HOME, ROOT } from "../config.ts";
+import { HOME, ROOT, DEPTH } from "../config.ts";
 import { sh } from "../shell.ts";
 import { buildArchitectureIR, buildLifecycleIR } from "./ir.ts";
 import { traceDir, genSummaries, fmtCost, msSince, fmtDuration, type GenSummary } from "../trace.ts";
@@ -198,7 +198,10 @@ export function maybeStartUi(enabled: boolean): void {
     server.unref();
     console.log(`ui: http://localhost:${server.port}`);
   } catch {
-    console.log(`ui: http://localhost:${port}`);
+    // port already taken (another skynet process is serving it) - only the first process
+    // (DEPTH 0, i.e. SKYNET_DEPTH unset or "0") prints the notice, so spawnNextGen's chain of
+    // sibling generations doesn't reprint the same line once per generation.
+    if (DEPTH === 0) console.log(`ui: http://localhost:${port} (already running)`);
   }
 }
 

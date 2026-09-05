@@ -8,7 +8,7 @@ import { parseToolCmd, isBlockedCmd } from "./tools.ts";
 import { agentLoop } from "./agent.ts";
 import { chat } from "./providers/index.ts";
 import { gate, disallowedDiffFiles, diffHasSymlink } from "./gate.ts";
-import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag, takeFlagValue } from "./evolve.ts";
+import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag, takeFlagValue, pickGoalPrompt } from "./evolve.ts";
 import { parseAdoptFlags } from "./adopt.ts";
 import { parseRunFlags } from "./cli.ts";
 import { appendTrace, readTraceFiles, genSummaries } from "./trace.ts";
@@ -85,6 +85,12 @@ async function testEvolve(scratch: string) {
   const goalFile = join(scratch, "goal.txt");
   await Bun.write(goalFile, "goal from file\n");
   assert((await resolveGoal(goalFile)) === "goal from file", "resolveGoal reads a file");
+
+  const withSubjects = pickGoalPrompt("src", ["fix: flag guard", "fix: trace nit"]);
+  assert(withSubjects.includes("fix: flag guard") && withSubjects.includes("fix: trace nit"), "pickGoalPrompt includes recent commit subjects");
+  assert(withSubjects.includes("Prefer a different subsystem"), "pickGoalPrompt steers away from recent subjects");
+  const noSubjects = pickGoalPrompt("src", []);
+  assert(!noSubjects.includes("Prefer a different subsystem"), "pickGoalPrompt omits steering when there's no history");
 }
 
 function testTools() {
@@ -141,11 +147,13 @@ async function testOllamaProvider(tmp: string) {
 
   let seenPath = "";
   let seenAuth = "";
+  let requestCount = 0;
   const server = Bun.serve({
     port: 0,
     fetch(req) {
       seenPath = new URL(req.url).pathname;
       seenAuth = req.headers.get("authorization") ?? "";
+      requestCount++;
       return Response.json({
         id: "mock", object: "chat.completion", created: 0, model: "qwen3-coder:480b", system_fingerprint: null,
         choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "LESSON:mock" } }],
@@ -164,6 +172,10 @@ async function testOllamaProvider(tmp: string) {
   }
   assert(seenPath === "/v1/chat/completions", `ollama request path is /v1/chat/completions (got ${seenPath})`);
   assert(seenAuth === "Bearer test", `ollama request carries bearer auth (got ${seenAuth})`);
+  // maxTurns was 2 but the mock reply carries no tool calls: agentLoop must stop right after the
+  // first reply (the standard "no tool call ends the loop" convention), never spending a second
+  // turn just because the budget allowed one.
+  assert(requestCount === 1, `agentLoop stops after a no-tool-call reply instead of running all maxTurns (got ${requestCount} requests)`);
 }
 
 function testGateRules() {

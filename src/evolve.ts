@@ -97,15 +97,25 @@ async function ensureRepo(dir: string) {
   await sh(`git add -A && git commit -qm "chore: initial commit"`, dir);
 }
 
+// exported (pure, no I/O) so it can be selftested directly without a real LLM call - the recent
+// commit subjects are passed in already fetched, not read from git here.
+export function pickGoalPrompt(src: string, recentSubjects: string[]): string {
+  const recent = recentSubjects.length
+    ? `Last ${recentSubjects.length} evolve commits (most recent first):\n${recentSubjects.map((s) => `- ${s}`).join("\n")}\n\nPrefer a different subsystem or a higher-leverage change than these recent ones - don't cluster on the same area again.\n\n`
+    : "";
+  return `You are skynet, choosing your own next self-improvement.\nLessons so far:\n${recall() || "(none)"}\n\n${recent}Current source (skynet.ts is a thin entry; the code lives in the files under src/):\n${src}\n\nReply with exactly one line: one small, concrete improvement to make to the files under src/.`;
+}
+
+async function recentCommitSubjects(childDir: string): Promise<string[]> {
+  const r = await sh("git log --format=%s -10", childDir);
+  return r.code === 0 ? r.text.trim().split("\n").filter(Boolean) : [];
+}
+
 async function pickGoal(childDir: string) {
   const files = ["skynet.ts", ...new Bun.Glob("src/**/*.ts").scanSync({ cwd: childDir })].sort();
   const src = files.map((f) => `--- ${f} ---\n${readFileSync(join(childDir, f), "utf8")}`).join("\n");
-  const { msg } = await chat(MODEL(), [
-    {
-      role: "user",
-      content: `You are skynet, choosing your own next self-improvement.\nLessons so far:\n${recall() || "(none)"}\n\nCurrent source (skynet.ts is a thin entry; the code lives in the files under src/):\n${src}\n\nReply with exactly one line: one small, concrete improvement to make to the files under src/.`,
-    },
-  ]);
+  const recentSubjects = await recentCommitSubjects(childDir);
+  const { msg } = await chat(MODEL(), [{ role: "user", content: pickGoalPrompt(src, recentSubjects) }]);
   const text = (msg.content as string) ?? "";
   return text.trim().split("\n")[0]!;
 }
@@ -197,7 +207,7 @@ export async function evolve(generations: number, goalArg: string | undefined, m
 Constraints: only edit files inside this directory, never touch .env, keep "bun skynet.ts --selftest", "bunx tsc --noEmit" and "bunx eslint --no-inline-config ." passing, add one selftest assertion covering your change, do not commit.
 Never touch these files: ${ALWAYS_PROTECTED_FILES.join(", ")} — any change to them causes automatic rejection. package.json and bun.lock are also rejected unless this goal explicitly asks for a dependency change.
 Never run "bun skynet.ts evolve" or "bun skynet.ts <target>" — this is a self-modification task, not an evolve/repair run; that is blocked and will fail.
-When done, reply with exactly one line starting with "LESSON:".`;
+Once the goal is implemented and your own checks pass, stop calling tools: reply with exactly one line starting with "LESSON:" and no tool calls. That ends the run immediately, so do this as soon as you're done instead of re-running checks.`;
   appendTrace(n, "stage", { stage: "agent" });
   const { lesson, totalCost, budgetExceeded } = await agentLoop(
     child,
