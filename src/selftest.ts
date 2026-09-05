@@ -1,4 +1,4 @@
-import { mkdirSync, chmodSync, existsSync, statSync } from "fs";
+import { mkdirSync, chmodSync, existsSync, statSync, appendFileSync } from "fs";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
 import { ROOT, DEPTH, VERSION, MODEL } from "./config.ts";
@@ -220,6 +220,18 @@ async function testUi(scratch: string) {
   appendTrace(2, "turn", { turn: 1, cost: 0.1 }, trDir);
   appendTrace(2, "turn", { turn: 2, cost: 0.2 }, trDir);
   appendTrace(2, "turn", { turn: 3, cost: 0.3 }, trDir);
+
+  // simulate a hard kill (SIGINT) mid-appendFileSync: the torn final line used to make
+  // readTraceFiles/genSummaries/buildLifecycleIR throw forever until the file was hand-deleted.
+  const gen2File = join(trDir, "gen-2.jsonl");
+  const gen2EventsBefore = readTraceFiles(trDir).find((f) => f.gen === 2)!.events.length;
+  // torn line exactly as a hard kill mid-append would leave it: valid prefix, no closing brace
+  appendFileSync(gen2File, '{"t":"' + new Date().toISOString() + ',"gen":2,"event":"turn"\n');
+  const tornFiles = readTraceFiles(trDir);
+  const gen2After = tornFiles.find((f) => f.gen === 2)!.events;
+  assert(tornFiles.length === 2 && gen2After.length === gen2EventsBefore && gen2After.every((e) => typeof e === "object" && e !== null), "trace: torn final line skipped, only well-formed events returned");
+  const tornSummaries = genSummaries(trDir);
+  assert(tornSummaries.length === 2 && tornSummaries.every((g) => g.status === "running" || g.status === "promoted" || g.status === "rejected"), "genSummaries: survives a torn final trace line without throwing");
 
   const summaries = genSummaries(trDir);
   assert(summaries.length === 2, `genSummaries: one row per gen (got ${summaries.length})`);
