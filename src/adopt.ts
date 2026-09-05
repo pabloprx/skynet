@@ -26,7 +26,9 @@ export async function adopt(url: string, ref: string, _budget: number, noUi = fa
   const { n, child } = await prepareChild();
 
   const goal = `adopt ${url}`;
-  appendTrace(n, "start", { goal });
+  // prepareChild() already wrote this generation's "start" event (with pid) - just record the goal.
+  appendTrace(n, "goal", { goal });
+  appendTrace(n, "stage", { stage: "merge" });
   const beforeSha = (await sh("git rev-parse HEAD", child)).text.trim();
   const pull = await sh(`git pull --no-ff --no-edit ${JSON.stringify(url)} ${JSON.stringify(ref)}`, child, 120_000);
 
@@ -40,10 +42,12 @@ export async function adopt(url: string, ref: string, _budget: number, noUi = fa
     // unstaged diff, same shape gate() already expects, then re-commit once it passes below.
     const afterSha = (await sh("git rev-parse HEAD", child)).text.trim();
     if (afterSha !== beforeSha) await sh(`git reset ${beforeSha}`, child);
+    appendTrace(n, "stage", { stage: "gate" });
     gateResult = await gate(child, n, goal);
   }
 
   if (gateResult.ok) {
+    appendTrace(n, "stage", { stage: "promote" });
     await promote(child, n, goal);
     learn("self", `gen ${n} adopted: ${goal}`);
     console.log(`gen ${n} adopted.`);

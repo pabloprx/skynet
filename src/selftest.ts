@@ -216,23 +216,33 @@ async function testUi(scratch: string) {
   // a still-running gen (start + turn events, no promoted/rejected) with a 300-char goal: exercises
   // both the "turn" trace event and the lifecycle sublabel-overflow fix in the same case.
   const longGoal = "x".repeat(300);
-  appendTrace(2, "start", { goal: longGoal }, trDir);
+  // pid: process.pid - this test process is alive by definition, so genSummaries reads this gen
+  // as "running" (no pid, or a dead one, now reads "killed" - see gate/statusOf in trace.ts).
+  appendTrace(2, "start", { goal: longGoal, pid: process.pid }, trDir);
   appendTrace(2, "turn", { turn: 1, cost: 0.1 }, trDir);
   appendTrace(2, "turn", { turn: 2, cost: 0.2 }, trDir);
   appendTrace(2, "turn", { turn: 3, cost: 0.3 }, trDir);
 
+  // a "start" event whose pid is provably dead (no terminal event either) - the stale/killed
+  // detection this task added: 999999 is never a live pid on this box.
+  appendTrace(3, "start", { goal: "dead process", pid: 999999 }, trDir);
+
   const summaries = genSummaries(trDir);
-  assert(summaries.length === 2, `genSummaries: one row per gen (got ${summaries.length})`);
+  assert(summaries.length === 3, `genSummaries: one row per gen (got ${summaries.length})`);
   const gen2 = summaries.find((s) => s.gen === 2)!;
   assert(gen2.status === "running" && gen2.turns === 3 && gen2.cost === 0.3, `genSummaries: gen 2 running (turn 3), cost 0.3 (got ${JSON.stringify(gen2)})`);
   const gen1 = summaries.find((s) => s.gen === 1)!;
   assert(gen1.status === "promoted" && gen1.cost === 0.02, `genSummaries: gen 1 promoted, cost 0.02 (got ${JSON.stringify(gen1)})`);
+  const gen3 = summaries.find((s) => s.gen === 3)!;
+  assert(gen3.status === "killed", `genSummaries: gen 3 killed (dead pid, no terminal event) (got ${JSON.stringify(gen3)})`);
 
   const life = buildLifecycleIR(trDir);
-  assert(life.states.length === 3, `buildLifecycleIR has 3 gen stages incl. summary (got ${life.states.length})`);
+  assert(life.states.length === 4, `buildLifecycleIR has 4 gen stages incl. summary (got ${life.states.length})`);
   const runningState = life.states.find((s) => s.id === "gen2")!;
-  assert(runningState.type === "active" && runningState.label.includes("running"), `lifecycle: running gen has a distinct label (got ${JSON.stringify(runningState)})`);
+  assert(runningState.type === "active" && runningState.label.includes("running") && runningState.lane === "main", `lifecycle: running gen has a distinct label and main lane (got ${JSON.stringify(runningState)})`);
   assert(runningState.sublabel.length <= 30, `lifecycle: sublabel fits archify's legible-minimum budget (got ${runningState.sublabel.length} chars: "${runningState.sublabel}")`);
+  const killedState = life.states.find((s) => s.id === "gen3")!;
+  assert(killedState.type === "failure" && killedState.lane === "events", `lifecycle: killed gen lands in the events lane (got ${JSON.stringify(killedState)})`);
 
   await testArchifyRender(scratch, arch, life);
 }

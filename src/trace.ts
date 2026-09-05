@@ -15,6 +15,10 @@ export interface TraceEvent {
   provider?: string;
   model?: string;
   turn?: number;
+  pid?: number;
+  stage?: string;
+  ms?: number;
+  cmd?: string;
 }
 
 // dir param (default HOME/trace) lets tests point at a tmp dir without relying on mutating
@@ -41,31 +45,104 @@ export function readTraceFiles(dir: string = traceDir()): { gen: number; events:
   }));
 }
 
-// one row per generation for "skynet.ts log" and the ui's log table: cost/turns are "so far" -
-// a gen with a "start" event but no "promoted"/"rejected"/"reverted" is still running (or was
-// killed mid-run, e.g. SIGINT - it then stays "running" forever, there's no way to tell the two
-// apart from the trace file alone).
-export interface GenSummary { gen: number; status: "running" | "promoted" | "rejected"; turns: number; cost: number; goal: string; reason?: string }
+// $ and duration formatting shared by the CLI log, the ui table and the lifecycle map, so the
+// three can never disagree on how a number reads (they used to: toFixed(2) vs toFixed(4)).
+export const fmtCost = (c: number) => "$" + c.toFixed(4);
+export const msSince = (iso: string) => (iso ? Date.now() - Date.parse(iso) : 0);
+export function fmtDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m${s % 60}s`;
+}
+
+// a process is "alive" if signal 0 delivery doesn't fail with ESRCH; EPERM (owned by someone
+// else, e.g. re-run as another user) still counts as alive - only ESRCH proves it's gone.
+function alive(pid?: number): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+// one row per generation for "skynet.ts log" and the ui's log table: cost/turns/stage/goal are
+// "so far". A gen with a "start" event but no terminal (promoted/rejected/reverted) event is
+// "running" while its start pid is still alive, else "killed" - it died without a terminal event
+// (SIGINT, OOM, host reboot) rather than being a live run the UI just hasn't refreshed.
+export interface GenSummary {
+  gen: number;
+  status: "running" | "promoted" | "rejected" | "killed";
+  stage: string;
+  turns: number;
+  cost: number;
+  goal: string;
+  reason?: string;
+  pid?: number;
+  lastCmd?: string;
+  startedAt: string;
+  lastEventAt: string;
+}
 
 export function genSummaries(dir: string = traceDir()): GenSummary[] {
   return readTraceFiles(dir).map(({ gen, events }) => summarizeGen(gen, events));
 }
 
+function lastOf<K extends keyof TraceEvent>(events: TraceEvent[], key: K): TraceEvent[K] | undefined {
+  for (let i = events.length - 1; i >= 0; i--) if (events[i]![key] !== undefined) return events[i]![key];
+  return undefined;
+}
+
+function statusOf(startPid: number | undefined, terminal: TraceEvent | undefined): GenSummary["status"] {
+  if (!terminal) return alive(startPid) ? "running" : "killed";
+  return terminal.event === "promoted" ? "promoted" : "rejected";
+}
+
+function stageOf(events: TraceEvent[], terminal: TraceEvent | undefined): string {
+  if (terminal) return terminal.event;
+  return lastOf(events, "stage") ?? "start";
+}
+
+// pulled out of summarizeGen purely to keep summarizeGen's own eslint `complexity` count down -
+// each optional-chain/nullish access below counts as a branch on whichever function it's written in.
+function eventTime(e: TraceEvent | undefined, fallback: TraceEvent | undefined): string {
+  if (e) return e.t;
+  if (fallback) return fallback.t;
+  return "";
+}
+
+function isTerminal(e: TraceEvent): boolean {
+  return e.event === "promoted" || e.event === "rejected" || e.event === "reverted";
+}
+
 function summarizeGen(gen: number, events: TraceEvent[]): GenSummary {
-  const goal = events.find((e) => e.event === "start")?.goal ?? "";
   const turns = events.filter((e) => e.event === "turn").length;
-  // "turn" events and the terminal promoted/rejected event both carry the *cumulative* cost so
-  // far, not a per-event delta - take the last one seen rather than summing (summing would
-  // double-count the turns already folded into the terminal event's total).
-  const costs = events.map((e) => e.cost).filter((c): c is number => c !== undefined);
-  const cost = costs.length ? costs[costs.length - 1]! : 0;
-  const rejected = events.find((e) => e.event === "rejected" || e.event === "reverted");
-  const status: GenSummary["status"] = events.some((e) => e.event === "promoted") ? "promoted" : rejected ? "rejected" : "running";
-  return { gen, status, turns, cost, goal, reason: rejected?.reason };
+  const startEvent = events.find((e) => e.event === "start");
+  const terminal = events.find(isTerminal);
+  const startPid = startEvent?.pid;
+  return {
+    gen,
+    turns,
+    // "turn" events and the terminal promoted/rejected event both carry the *cumulative* cost so
+    // far, not a per-event delta - take the last one seen rather than summing (summing would
+    // double-count the turns already folded into the terminal event's total).
+    cost: lastOf(events, "cost") ?? 0,
+    goal: lastOf(events, "goal") ?? "",
+    status: statusOf(startPid, terminal),
+    stage: stageOf(events, terminal),
+    reason: terminal?.reason,
+    pid: startPid,
+    lastCmd: lastOf(events, "cmd"),
+    startedAt: eventTime(startEvent, events[0]),
+    lastEventAt: eventTime(events[events.length - 1], events[0]),
+  };
 }
 
 function statusLabel(r: GenSummary): string {
   if (r.status === "running") return `running (turn ${r.turns})`;
+  if (r.status === "killed") return `killed (turn ${r.turns})`;
   if (r.status === "rejected") return `rejected: ${r.reason ?? ""}`;
   return "promoted";
 }
@@ -73,6 +150,10 @@ function statusLabel(r: GenSummary): string {
 export function printLog() {
   const rows = genSummaries();
   if (!rows.length) return console.log("no generations logged yet.");
-  console.log("gen\tstatus\tturns\tcost\tgoal");
-  for (const r of rows) console.log(`${r.gen}\t${statusLabel(r)}\t${r.turns}\t$${r.cost.toFixed(4)}\t${r.goal.slice(0, 80)}`);
+  console.log("gen\tstatus\tstage\tturns\telapsed\tage\tcost\tlast cmd\tgoal");
+  for (const r of rows) {
+    const elapsed = fmtDuration(msSince(r.startedAt));
+    const age = fmtDuration(msSince(r.lastEventAt));
+    console.log(`${r.gen}\t${statusLabel(r)}\t${r.stage}\t${r.turns}\t${elapsed}\t${age}\t${fmtCost(r.cost)}\t${(r.lastCmd ?? "").slice(0, 60)}\t${r.goal.slice(0, 80)}`);
+  }
 }

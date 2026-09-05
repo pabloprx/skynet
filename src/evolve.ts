@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { HOME, MODEL, DEPTH, ROOT } from "./config.ts";
+import { HOME, MODEL, DEPTH, ROOT, provider } from "./config.ts";
 import { sh } from "./shell.ts";
 import { recall, learn } from "./memory.ts";
 import { gate, ALWAYS_PROTECTED_FILES } from "./gate.ts";
@@ -112,6 +112,11 @@ export async function prepareChild() {
   const n = nextGenDir(genRoot);
   const child = join(genRoot, String(n));
 
+  // written as early as possible (before the clone even runs) so the trace/log/UI know this
+  // generation exists immediately - previously the first trace line landed only after pickGoal's
+  // ~65s LLM call, so a fresh generation was invisible for a quarter of its own wall clock.
+  appendTrace(n, "start", { pid: process.pid, provider: provider(), model: MODEL() });
+  appendTrace(n, "stage", { stage: "clone" });
   const cl = await sh(`git clone ${JSON.stringify(ROOT)} ${JSON.stringify(child)}`, genRoot, 300_000);
   if (cl.code !== 0) throw new Error(`self-clone failed: ${cl.text}`);
   // promote() pulls the child's commit into ROOT by path, not by remote — the child never needs
@@ -139,43 +144,19 @@ async function spawnNextGen(remaining: number, maxTurns: number, budget: number,
   process.exit(await p.exited);
 }
 
-export async function evolve(generations: number, goalArg: string | undefined, maxTurns: number, budget: number, noUi = false) {
-  if (process.env.SKYNET_CHILD) throw new Error("evolve: refusing to run recursively inside a child (SKYNET_CHILD is set)");
-  maybeStartUi(!noUi);
-  const { n, child } = await prepareChild();
-  if (existsSync(join(ROOT, ".env"))) await Bun.write(join(child, ".env"), readFileSync(join(ROOT, ".env")));
-  // --ignore-scripts: package.json here is whatever a prior generation promoted — gate() now also
-  // installs with --ignore-scripts (see gate.ts), so a postinstall script must never get a chance
-  // to execute anywhere in the self-modification pipeline, only human-run installs run scripts.
-  const inst = await sh("bun install --ignore-scripts", child, 300_000);
-  if (inst.code !== 0) throw new Error(`bun install failed in ${child}: ${inst.text}`);
-
+// factored out of evolve() purely to keep evolve()'s own cyclomatic complexity under the eslint
+// gate - the goal is either resolved from goalArg or picked fresh, and either way gets traced.
+async function resolveAndTraceGoal(n: number, goalArg: string | undefined, child: string): Promise<string> {
+  appendTrace(n, "stage", { stage: goalArg !== undefined ? "resolve-goal" : "picking-goal" });
   const goal = goalArg !== undefined ? await resolveGoal(goalArg) : await pickGoal(child);
-  console.log(`gen ${n} goal: ${goal}`);
-  appendTrace(n, "start", { goal });
+  appendTrace(n, "goal", { goal });
+  return goal;
+}
 
-  const system = `You are skynet, improving your own source at ${child}. Goal: ${goal}.
-Constraints: only edit files inside this directory, never touch .env, keep "bun skynet.ts --selftest", "bunx tsc --noEmit" and "bunx eslint --no-inline-config ." passing, add one selftest assertion covering your change, do not commit.
-Never touch these files: ${ALWAYS_PROTECTED_FILES.join(", ")} — any change to them causes automatic rejection. package.json and bun.lock are also rejected unless this goal explicitly asks for a dependency change.
-Never run "bun skynet.ts evolve" or "bun skynet.ts <target>" — this is a self-modification task, not an evolve/repair run; that is blocked and will fail.
-When done, reply with exactly one line starting with "LESSON:".`;
-  const { lesson, totalCost, budgetExceeded } = await agentLoop(
-    child,
-    system,
-    "Make the change now.",
-    maxTurns,
-    budget,
-    { SKYNET_CHILD: "1", SKYNET_DEPTH: String(DEPTH + 1) },
-    (turn, cost) => appendTrace(n, "turn", { turn, cost }),
-  );
-  console.log(`gen ${n} total cost: $${totalCost.toFixed(6)}`);
-
-  const gateResult = budgetExceeded
-    ? { ok: false, reason: `budget exceeded ($${totalCost.toFixed(6)} > $${budget.toFixed(6)})` }
-    : await gate(child, n, goal);
-
+// same reason as resolveAndTraceGoal above: keeps the promoted/rejected branch out of evolve()'s
+// own complexity count.
+function recordOutcome(n: number, child: string, gateResult: { ok: boolean; reason?: string }, goal: string, totalCost: number, lesson: string | null): void {
   if (gateResult.ok) {
-    await promote(child, n, goal);
     learn("self", `gen ${n} promoted: ${goal}: ${lesson ?? "(no lesson)"}`);
     console.log(`gen ${n} promoted.`);
     appendTrace(n, "promoted", { cost: totalCost });
@@ -184,6 +165,50 @@ When done, reply with exactly one line starting with "LESSON:".`;
     console.log(`gen ${n} rejected (${gateResult.reason}), left at ${child} for inspection.`);
     appendTrace(n, "rejected", { reason: gateResult.reason, cost: totalCost });
   }
+}
+
+export async function evolve(generations: number, goalArg: string | undefined, maxTurns: number, budget: number, noUi = false) {
+  if (process.env.SKYNET_CHILD) throw new Error("evolve: refusing to run recursively inside a child (SKYNET_CHILD is set)");
+  maybeStartUi(!noUi);
+  const { n, child } = await prepareChild();
+  if (existsSync(join(ROOT, ".env"))) await Bun.write(join(child, ".env"), readFileSync(join(ROOT, ".env")));
+  // --ignore-scripts: package.json here is whatever a prior generation promoted — gate() now also
+  // installs with --ignore-scripts (see gate.ts), so a postinstall script must never get a chance
+  // to execute anywhere in the self-modification pipeline, only human-run installs run scripts.
+  appendTrace(n, "stage", { stage: "install" });
+  const inst = await sh("bun install --ignore-scripts", child, 300_000);
+  if (inst.code !== 0) throw new Error(`bun install failed in ${child}: ${inst.text}`);
+
+  const goal = await resolveAndTraceGoal(n, goalArg, child);
+  console.log(`gen ${n} goal: ${goal}`);
+
+  const system = `You are skynet, improving your own source at ${child}. Goal: ${goal}.
+Constraints: only edit files inside this directory, never touch .env, keep "bun skynet.ts --selftest", "bunx tsc --noEmit" and "bunx eslint --no-inline-config ." passing, add one selftest assertion covering your change, do not commit.
+Never touch these files: ${ALWAYS_PROTECTED_FILES.join(", ")} — any change to them causes automatic rejection. package.json and bun.lock are also rejected unless this goal explicitly asks for a dependency change.
+Never run "bun skynet.ts evolve" or "bun skynet.ts <target>" — this is a self-modification task, not an evolve/repair run; that is blocked and will fail.
+When done, reply with exactly one line starting with "LESSON:".`;
+  appendTrace(n, "stage", { stage: "agent" });
+  const { lesson, totalCost, budgetExceeded } = await agentLoop(
+    child,
+    system,
+    "Make the change now.",
+    maxTurns,
+    budget,
+    { SKYNET_CHILD: "1", SKYNET_DEPTH: String(DEPTH + 1) },
+    (turn, cost, ms, cmd) => appendTrace(n, "turn", { turn, cost, ms, cmd }),
+  );
+  console.log(`gen ${n} total cost: $${totalCost.toFixed(6)}`);
+
+  appendTrace(n, "stage", { stage: "gate" });
+  const gateResult = budgetExceeded
+    ? { ok: false, reason: `budget exceeded ($${totalCost.toFixed(6)} > $${budget.toFixed(6)})` }
+    : await gate(child, n, goal);
+
+  if (gateResult.ok) {
+    appendTrace(n, "stage", { stage: "promote" });
+    await promote(child, n, goal);
+  }
+  recordOutcome(n, child, gateResult, goal, totalCost, lesson);
 
   const remaining = generations - 1;
   if (remaining > 0) await spawnNextGen(remaining, maxTurns, budget, goalArg, noUi);

@@ -19,13 +19,20 @@ function logUsage(turn: number, u: Usage): number {
 const textOf = (content: unknown) => (typeof content === "string" ? content : "");
 const lessonOf = (text: string) => text.match(/^LESSON:(.*)$/m)?.[1] ?? null;
 
+export type OnTurn = (turn: number, cost: number, ms: number, cmd?: string) => void;
+
 // evolve()'s onTurn callback appends a "turn" trace event per turn - factored out so agentLoop's
-// own cyclomatic complexity (eslint's `complexity` gate) doesn't grow with each new optional caller hook.
-function reportTurn(onTurn: ((turn: number, cost: number) => void) | undefined, turn: number, cost: number) {
-  if (onTurn) onTurn(turn, cost);
+// own cyclomatic complexity (eslint's `complexity` gate) doesn't grow with each new optional caller
+// hook. cmd is truncated here (not by every caller) so the trace file never grows unbounded on a
+// long bash one-liner.
+function reportTurn(onTurn: OnTurn | undefined, turn: number, cost: number, ms: number, cmd?: string) {
+  if (onTurn) onTurn(turn, cost, ms, cmd?.slice(0, 120));
 }
 
-async function runTools(dir: string, calls: ChatToolCall[], messages: ChatMessages[], childEnv?: Record<string, string>) {
+// returns the last command actually run, for the caller's turn-trace event - "undefined" when
+// every call in this turn was malformed and never ran.
+async function runTools(dir: string, calls: ChatToolCall[], messages: ChatMessages[], childEnv?: Record<string, string>): Promise<string | undefined> {
+  let lastCmd: string | undefined;
   for (const c of calls) {
     const parsed = parseToolCmd(c.function.arguments);
     if ("error" in parsed) {
@@ -34,12 +41,14 @@ async function runTools(dir: string, calls: ChatToolCall[], messages: ChatMessag
       continue;
     }
     const cmd = parsed.cmd;
+    lastCmd = cmd;
     console.log(`$ ${cmd}`);
     const r = isBlockedCmd(cmd)
       ? { code: 1, text: "blocked: command attempts to leave the working directory, touch .env/sudo, or run a recursive evolve" }
       : await sh(cmd, dir, undefined, childEnv);
     messages.push({ role: "tool", toolCallId: c.id, content: `exit ${r.code}\n${r.text}` });
   }
+  return lastCmd;
 }
 
 // generic tool-loop: give the model a bash tool in `dir` until it replies with no tool calls.
@@ -57,9 +66,9 @@ export async function agentLoop(
   maxTurns: number,
   maxCost = Infinity,
   childEnv?: Record<string, string>,
-  onTurn?: (turn: number, cost: number) => void,
+  onTurn?: OnTurn,
 ) {
-  if (useClaude()) return claudeRun(dir, system, user, maxTurns, maxCost, childEnv);
+  if (useClaude()) return claudeRun(dir, system, user, maxTurns, maxCost, childEnv, onTurn);
   if (provider() === "ollama") console.log("ollama: no cost reporting, budget caps by turns only");
   const messages: ChatMessages[] = [
     { role: "system", content: [{ type: "text", text: system, cacheControl: { type: "ephemeral" } }] },
@@ -68,10 +77,12 @@ export async function agentLoop(
   let totalCost = 0;
 
   for (let turn = 0; turn < maxTurns; turn++) {
+    const t0 = Date.now();
     const { msg, usage } = await chat(MODEL(), messages, [bashTool]);
+    const ms = Date.now() - t0;
     totalCost += logUsage(turn, usage);
-    reportTurn(onTurn, turn + 1, totalCost);
     if (totalCost > maxCost) {
+      reportTurn(onTurn, turn + 1, totalCost, ms);
       console.log(`budget exceeded: $${totalCost.toFixed(6)} > $${maxCost.toFixed(6)}, stopping`);
       return { lesson: null, totalCost, budgetExceeded: true };
     }
@@ -79,8 +90,12 @@ export async function agentLoop(
     const text = textOf(msg.content);
     if (text) console.log(text);
     const calls: ChatToolCall[] = msg.toolCalls ?? [];
-    if (!calls.length) return { lesson: lessonOf(text), totalCost, budgetExceeded: false };
-    await runTools(dir, calls, messages, childEnv);
+    if (!calls.length) {
+      reportTurn(onTurn, turn + 1, totalCost, ms);
+      return { lesson: lessonOf(text), totalCost, budgetExceeded: false };
+    }
+    const cmd = await runTools(dir, calls, messages, childEnv);
+    reportTurn(onTurn, turn + 1, totalCost, ms, cmd);
   }
   return { lesson: null, totalCost, budgetExceeded: totalCost > maxCost };
 }

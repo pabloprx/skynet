@@ -1,11 +1,11 @@
 // bun skynet.ts ui [--port N] [--build]: renders the architecture + lifecycle diagrams via the
 // pinned archify CLI and serves them alongside the generation log. See CLAUDE.md / README "Web UI".
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, statSync, readdirSync } from "fs";
 import { join } from "path";
 import { HOME, ROOT } from "../config.ts";
 import { sh } from "../shell.ts";
 import { buildArchitectureIR, buildLifecycleIR } from "./ir.ts";
-import { traceDir, genSummaries, type GenSummary } from "../trace.ts";
+import { traceDir, genSummaries, fmtCost, msSince, fmtDuration, type GenSummary } from "../trace.ts";
 
 const ARCHIFY_URL = "https://github.com/tt-a1i/archify";
 const ARCHIFY_SHA = "5769acefcc2ebd696a4f9ed3ac9cb6cca1d75c70";
@@ -56,6 +56,14 @@ async function renderOne(type: "architecture" | "lifecycle", ir: unknown, jsonPa
   return r.code === 0 ? { ok: true } : { ok: false, error: r.text.slice(-1000) };
 }
 
+// so a diagram left open in a tab keeps refreshing itself the way the index already did - one
+// string replace, skipped if archify's own template ever grows this tag itself.
+async function injectRefresh(htmlPath: string): Promise<void> {
+  const html = await Bun.file(htmlPath).text();
+  if (html.includes('http-equiv="refresh"')) return;
+  await Bun.write(htmlPath, html.replace("<head>", '<head><meta http-equiv="refresh" content="5">'));
+}
+
 export interface BuildResult { archHtml: string; lifeHtml: string; archResult: RenderResult; lifeResult: RenderResult }
 
 export async function buildUi(skynetRoot: string = ROOT, trDir: string = traceDir()): Promise<BuildResult> {
@@ -68,7 +76,38 @@ export async function buildUi(skynetRoot: string = ROOT, trDir: string = traceDi
     renderOne("architecture", buildArchitectureIR(skynetRoot), join(dir, "architecture.json"), archHtml),
     renderOne("lifecycle", buildLifecycleIR(trDir), join(dir, "lifecycle.json"), lifeHtml),
   ]);
+  if (archResult.ok) await injectRefresh(archHtml);
+  if (lifeResult.ok) await injectRefresh(lifeHtml);
   return { archHtml, lifeHtml, archResult, lifeResult };
+}
+
+// GET / must stay well under 100ms (it's polled every 5s by its own meta refresh), so the two
+// diagram renders - each a `node archify.mjs render` subprocess - only ever run for GET
+// /architecture.html or /lifecycle.html, and only when the trace or the source tree actually
+// changed since the last render. mtime-keyed, in-memory, one slot: a single skynet process only
+// ever serves one generation history.
+let uiCache: { sig: number; result: BuildResult } | null = null;
+
+function fileMtimeMs(path: string): number {
+  try { return statSync(path).mtimeMs; } catch { return 0; }
+}
+
+function dirMtimeMs(dir: string): number {
+  if (!existsSync(dir)) return 0;
+  return readdirSync(dir).reduce((max, f) => Math.max(max, fileMtimeMs(join(dir, f))), 0);
+}
+
+function srcMtimeMs(root: string): number {
+  const files = ["skynet.ts", ...new Bun.Glob("src/**/*.ts").scanSync({ cwd: root })];
+  return files.reduce((max, f) => Math.max(max, fileMtimeMs(join(root, f))), 0);
+}
+
+async function buildUiCached(skynetRoot: string = ROOT, trDir: string = traceDir()): Promise<BuildResult> {
+  const sig = Math.max(dirMtimeMs(trDir), srcMtimeMs(skynetRoot));
+  if (uiCache && uiCache.sig === sig) return uiCache.result;
+  const result = await buildUi(skynetRoot, trDir);
+  uiCache = { sig, result };
+  return result;
 }
 
 function escapeHtml(s: string): string {
@@ -77,32 +116,37 @@ function escapeHtml(s: string): string {
 
 function statusCellHtml(r: GenSummary): string {
   if (r.status === "running") return `running (turn ${r.turns})`;
+  if (r.status === "killed") return `killed (turn ${r.turns})`;
   return escapeHtml(r.status);
+}
+
+function logRowHtml(r: GenSummary): string {
+  const elapsed = fmtDuration(msSince(r.startedAt));
+  const age = fmtDuration(msSince(r.lastEventAt));
+  const goalCell = `<span title="${escapeHtml(r.goal)}">${escapeHtml(r.goal.slice(0, 60))}</span>`;
+  const reason = r.status === "rejected" || r.status === "killed" ? (r.reason ?? "") : "";
+  return `<tr><td>${r.gen}</td><td>${statusCellHtml(r)}</td><td>${escapeHtml(r.stage)}</td><td>${r.turns}</td><td>${elapsed}</td>` +
+    `<td>${age}</td><td>${fmtCost(r.cost)}</td><td>${escapeHtml((r.lastCmd ?? "").slice(0, 60))}</td><td>${goalCell}</td><td>${escapeHtml(reason)}</td></tr>`;
 }
 
 function logTableHtml(): string {
   const rows = genSummaries();
   if (!rows.length) return "<p>no generations logged yet.</p>";
-  const trs = rows
-    .map(
-      (r) =>
-        `<tr><td>${r.gen}</td><td>${statusCellHtml(r)}</td><td>${r.turns}</td><td>$${r.cost.toFixed(4)}</td><td>${escapeHtml(r.goal.slice(0, 80))}</td><td>${escapeHtml(r.status === "rejected" ? (r.reason ?? "") : "")}</td></tr>`,
-    )
-    .join("");
-  return `<table><thead><tr><th>gen</th><th>status</th><th>turns</th><th>cost</th><th>goal</th><th>reason</th></tr></thead><tbody>${trs}</tbody></table>`;
+  const trs = rows.map(logRowHtml).join("");
+  return `<table><thead><tr><th>gen</th><th>status</th><th>stage</th><th>turns</th><th>elapsed</th><th>age</th><th>cost</th><th>last cmd</th><th>goal</th><th>reason</th></tr></thead><tbody>${trs}</tbody></table>`;
 }
 
-function indexHtml(result: BuildResult): string {
-  const err = (r: RenderResult, label: string) => (r.ok ? "" : `<p class="err">${label} render failed: ${escapeHtml(r.error ?? "")}</p>`);
+// no build, no archify subprocess - reads trace files only, so this stays well under 100ms even
+// while a generation is running (see uiCache above for the diagram pages).
+function indexHtml(): string {
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5"><title>skynet</title>
 <style>
-body{background:#111;color:#eee;font-family:ui-monospace,monospace;padding:2rem;max-width:900px;margin:0 auto}
+body{background:#111;color:#eee;font-family:ui-monospace,monospace;padding:2rem;max-width:1100px;margin:0 auto}
 a{color:#6cf} table{border-collapse:collapse;width:100%} td,th{border:1px solid #444;padding:4px 8px;text-align:left}
-.err{color:#f66} nav a{margin-right:1rem;font-size:1.2rem}
+nav a{margin-right:1rem;font-size:1.2rem}
 </style></head><body>
 <h1>skynet</h1>
 <nav><a href="/architecture.html">architecture</a><a href="/lifecycle.html">lifecycle</a></nav>
-${err(result.archResult, "architecture")}${err(result.lifeResult, "lifecycle")}
 <h2>generations</h2>
 ${logTableHtml()}
 </body></html>`;
@@ -115,10 +159,12 @@ export function startServer(port: number) {
     port,
     async fetch(req) {
       const path = new URL(req.url).pathname;
-      if (path === "/") return new Response(indexHtml(await buildUi()), { headers: { "content-type": "text/html" } });
+      if (path === "/") return new Response(indexHtml(), { headers: { "content-type": "text/html" } });
       if (path === "/architecture.html" || path === "/lifecycle.html") {
-        const file = Bun.file(join(uiDir(), path.slice(1)));
-        return (await file.exists()) ? new Response(file) : new Response("not built yet - visit / first", { status: 404 });
+        const result = await buildUiCached();
+        const r = path === "/architecture.html" ? result.archResult : result.lifeResult;
+        if (!r.ok) return new Response(`${path} render failed: ${r.error ?? ""}`, { status: 500 });
+        return new Response(Bun.file(join(uiDir(), path.slice(1))));
       }
       return new Response("not found", { status: 404 });
     },

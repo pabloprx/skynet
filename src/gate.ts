@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { ROOT, DEPTH } from "./config.ts";
 import { sh } from "./shell.ts";
 import { chat } from "./providers/index.ts";
+import { appendTrace } from "./trace.ts";
 
 // ---------- gate: the parent judges the child, the child must not be able to weaken the judgment ----------
 // files the child must never touch at all (any diff touching these is an automatic reject)
@@ -68,23 +69,29 @@ export async function gate(child: string, n: number, goal: string): Promise<{ ok
   // --ignore-scripts: an attacker who slips a "dependency" goal past disallowedDiffFiles could
   // otherwise plant a package.json postinstall and have it run right here, at full host privilege,
   // before any other check gets a vote (including on a generation the later checks go on to reject).
+  appendTrace(n, "stage", { stage: "gate:install" });
   const inst = await sh("bun install --ignore-scripts", child, 300_000);
   if (inst.code !== 0) return { ok: false, reason: `bun install failed: ${inst.text.slice(-500)}` };
 
+  appendTrace(n, "stage", { stage: "gate:tsc" });
   const tsc = await sh("bunx tsc --noEmit", child, 120_000);
   if (tsc.code !== 0) return { ok: false, reason: `tsc failed: ${tsc.text.slice(-500)}` };
 
+  appendTrace(n, "stage", { stage: "gate:lint" });
   const lint = await sh("bunx eslint --no-inline-config .", child, 120_000);
   if (lint.code !== 0) return { ok: false, reason: `lint failed: ${lint.text.slice(-500)}` };
 
+  appendTrace(n, "stage", { stage: "gate:selftest" });
   const st = await sh(`SKYNET_HOME=${JSON.stringify(join(tmpdir(), `skynet-gate-selftest-${n}-${Date.now()}`))} SKYNET_DEPTH=${DEPTH + 1} bun skynet.ts --selftest`, child, 60_000);
   if (st.code !== 0) return { ok: false, reason: `selftest failed: ${st.text.slice(-500)}` };
 
   // parent copies its own smoke test over whatever the child left, so the child can't weaken it
+  appendTrace(n, "stage", { stage: "gate:smoke" });
   await Bun.write(join(child, "smoke.test.ts"), readFileSync(join(ROOT, "smoke.test.ts")));
   const smoke = await sh(`SKYNET_HOME=${JSON.stringify(join(tmpdir(), `skynet-gate-smoke-${n}-${Date.now()}`))} SKYNET_DEPTH=${DEPTH + 1} bun test smoke.test.ts`, child, 120_000);
   if (smoke.code !== 0) return { ok: false, reason: `smoke test failed: ${smoke.text.slice(-500)}` };
 
+  appendTrace(n, "stage", { stage: "gate:review" });
   const review = await diffReview(child, goal);
   if (!review.pass) return { ok: false, reason: `diff review: ${review.reason}` };
 

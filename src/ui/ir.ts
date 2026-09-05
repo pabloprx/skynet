@@ -3,7 +3,7 @@
 // pinned archify clone for the schema this targets.
 import { readFileSync } from "fs";
 import { join, relative, dirname, basename } from "path";
-import { readTraceFiles, type TraceEvent } from "../trace.ts";
+import { genSummaries, fmtCost, type GenSummary } from "../trace.ts";
 
 type ComponentType = "frontend" | "backend" | "external";
 export interface Component { id: string; type: ComponentType; label: string; sublabel: string; row: number; col: number; pos: [number, number]; size: [number, number] }
@@ -235,29 +235,15 @@ export function buildArchitectureIR(root: string): ArchitectureIR {
 }
 
 // ---------- lifecycle ----------
-type GenType = "success" | "failure" | "active";
-interface GenState { gen: number; goal: string; cost: number; turns: number; type: GenType }
-interface LifecycleState { id: string; type: GenType | "neutral" | "start"; label: string; sublabel: string; lane: "main"; col: number }
+// three lanes so archify's lifecycle renderer (which always draws three bands - phase/event/
+// outcome, see renderers/lifecycle/render-lifecycle.mjs's bandFor()) never falls back to its
+// generic "Interruptions + recovery" / "Outcomes" titles over empty bands: "main" carries the
+// currently-running generation, "events" carries ones that died without a terminal trace event
+// (status "killed"), "terminal" carries promoted/rejected history plus the summary.
+type Lane = "main" | "events" | "terminal";
+type StateType = "start" | "active" | "success" | "failure" | "neutral";
+interface LifecycleState { id: string; type: StateType; label: string; sublabel: string; lane: Lane; col: number }
 interface Transition { id: string; from: string; to: string }
-
-// "turn" events and the terminal promoted/rejected event both carry the *cumulative* cost so far,
-// not a per-event delta - take the last one seen rather than summing (summing would double-count
-// the turns already folded into the terminal event's total).
-function lastCost(events: TraceEvent[]): number {
-  const costs = events.map((e) => e.cost).filter((c): c is number => c !== undefined);
-  return costs.length ? costs[costs.length - 1]! : 0;
-}
-
-function collapseGen(gen: number, events: TraceEvent[]): GenState {
-  const goal = events.find((e) => e.event === "start")?.goal ?? "";
-  const turns = events.filter((e) => e.event === "turn").length;
-  const type: GenType = events.some((e) => e.event === "promoted")
-    ? "success"
-    : events.some((e) => e.event === "rejected" || e.event === "reverted")
-      ? "failure"
-      : "active";
-  return { gen, goal, cost: lastCost(events), turns, type };
-}
 
 // archify's lifecycle validator (renderers/lifecycle/render-lifecycle.mjs, ~L190-198, via
 // renderers/shared/text-fit.mjs's minimumNodeTextWidth/availableNodeTextWidth) rejects a sublabel
@@ -267,45 +253,83 @@ function collapseGen(gen: number, events: TraceEvent[]): GenState {
 // longest sublabel that always fits is floor(110 / 3.6) = 30 chars.
 const MAX_SUBLABEL_CHARS = 30;
 
-function fitSublabel(prefix: string, goal: string): string {
+function fitSublabel(prefix: string, body: string): string {
   const budget = MAX_SUBLABEL_CHARS - prefix.length;
   if (budget <= 0) return prefix.slice(0, MAX_SUBLABEL_CHARS);
-  if (goal.length <= budget) return prefix + goal;
-  return prefix + (budget > 1 ? goal.slice(0, budget - 1) + "…" : goal.slice(0, budget));
+  if (body.length <= budget) return prefix + body;
+  return prefix + (budget > 1 ? body.slice(0, budget - 1) + "…" : body.slice(0, budget));
 }
 
-function lifecycleLabel(g: GenState): string {
-  return g.type === "active" ? `Gen ${g.gen} (running)` : `Gen ${g.gen}`;
+function laneOf(status: GenSummary["status"]): Lane {
+  if (status === "running") return "main";
+  if (status === "killed") return "events";
+  return "terminal";
 }
 
-function lifecycleSublabel(g: GenState): string {
-  const prefix = g.type === "active" ? `t${g.turns} $${g.cost.toFixed(2)} - ` : `$${g.cost.toFixed(2)} - `;
-  return fitSublabel(prefix, g.goal);
+function visualType(status: GenSummary["status"]): StateType {
+  if (status === "running") return "active";
+  if (status === "promoted") return "success";
+  return "failure"; // rejected or killed
+}
+
+// what a rejected/killed generation's sublabel leads with - the same reason the log table shows,
+// so the map and the table never tell two different stories about why a gen didn't survive.
+function reasonOf(g: GenSummary): string | undefined {
+  if (g.status === "killed") return `died at turn ${g.turns}`;
+  return g.reason;
+}
+
+function lifecycleLabel(g: GenSummary): string {
+  return g.status === "running" ? `Gen ${g.gen} (running)` : `Gen ${g.gen}`;
+}
+
+function lifecycleSublabel(g: GenSummary): string {
+  if (g.status === "running") return fitSublabel(`t${g.turns} ${fmtCost(g.cost)} - `, g.goal);
+  return fitSublabel(`${fmtCost(g.cost)} - `, reasonOf(g) ?? g.goal);
+}
+
+function toState(g: GenSummary, col: number): LifecycleState {
+  return { id: `gen${g.gen}`, type: visualType(g.status), label: lifecycleLabel(g), sublabel: lifecycleSublabel(g), lane: laneOf(g.status), col };
 }
 
 function emptyLifecycle(): { states: LifecycleState[]; transitions: Transition[] } {
   return {
     states: [
       { id: "start", type: "start", label: "Start", sublabel: "no generations yet", lane: "main", col: 0 },
-      { id: "summary", type: "neutral", label: "Summary", sublabel: "0 gens, 0 promoted, $0.00", lane: "main", col: 1 },
+      { id: "summary", type: "neutral", label: "Summary", sublabel: `0 gens, 0 promoted, ${fmtCost(0)}`, lane: "terminal", col: 0 },
     ],
-    transitions: [{ id: "start-summary", from: "start", to: "summary" }],
+    transitions: [],
   };
 }
 
-// schema caps col 0..4 and 5 states in the lane: at most the last 4 generations plus one summary state.
-function buildLifecycleStates(gens: GenState[]): { states: LifecycleState[]; transitions: Transition[] } {
+// chains consecutive states within one lane in gen order, so the map still reads as a history
+// (gen 12 -> gen 13 -> gen 14) rather than a scatter of disconnected boxes.
+function chainLane(states: LifecycleState[], lane: Lane): Transition[] {
+  const laneStates = states.filter((s) => s.lane === lane);
+  return laneStates.slice(1).map((s, i) => ({ id: `${laneStates[i]!.id}-${s.id}`, from: laneStates[i]!.id, to: s.id }));
+}
+
+// authoring contract (Lifecycle): main uses cols 0..4, event/terminal bands cap at 3 states
+// (cols 0..2) - terminal reserves its last slot for the summary state.
+function buildLifecycleStates(gens: GenSummary[]): { states: LifecycleState[]; transitions: Transition[] } {
   if (gens.length === 0) return emptyLifecycle();
-  const shown = gens.length <= 4 ? gens : gens.slice(-4);
-  const omitted = gens.length - shown.length;
-  const promotedCount = gens.filter((g) => g.type === "success").length;
+  const running = gens.filter((g) => g.status === "running").slice(-5);
+  const killed = gens.filter((g) => g.status === "killed").slice(-3);
+  const settled = gens.filter((g) => g.status === "promoted" || g.status === "rejected").slice(-2);
+  const shown = [...running, ...killed, ...settled];
+
+  const states: LifecycleState[] = [];
+  running.forEach((g, col) => states.push(toState(g, col)));
+  killed.forEach((g, col) => states.push(toState(g, col)));
+  settled.forEach((g, col) => states.push(toState(g, col)));
+
+  const promotedCount = gens.filter((g) => g.status === "promoted").length;
   const totalCost = gens.reduce((s, g) => s + g.cost, 0);
-  const states: LifecycleState[] = shown.map((g, col) => ({
-    id: `gen${g.gen}`, type: g.type, label: lifecycleLabel(g), sublabel: lifecycleSublabel(g), lane: "main", col,
-  }));
-  const summarySublabel = `${gens.length} gens, ${promotedCount} promoted, $${totalCost.toFixed(2)}` + (omitted > 0 ? ` (${omitted} earlier omitted)` : "");
-  states.push({ id: "summary", type: "neutral", label: "Summary", sublabel: summarySublabel, lane: "main", col: states.length });
-  const transitions: Transition[] = states.slice(1).map((s, i) => ({ id: `${states[i]!.id}-${s.id}`, from: states[i]!.id, to: s.id }));
+  const omitted = gens.length - shown.length;
+  const summarySublabel = fitSublabel("", `${gens.length} gens, ${promotedCount} promoted, ${fmtCost(totalCost)}` + (omitted > 0 ? ` (${omitted} more)` : ""));
+  states.push({ id: "summary", type: "neutral", label: "Summary", sublabel: summarySublabel, lane: "terminal", col: settled.length });
+
+  const transitions: Transition[] = [...chainLane(states, "main"), ...chainLane(states, "events"), ...chainLane(states, "terminal")];
   return { states, transitions };
 }
 
@@ -313,19 +337,23 @@ export interface LifecycleIR {
   schema_version: 1;
   diagram_type: "lifecycle";
   meta: { title: string; quality_profile: "standard" };
-  lanes: { id: "main"; label: string }[];
+  lanes: { id: Lane; label: string }[];
   states: LifecycleState[];
   transitions: Transition[];
 }
 
 export function buildLifecycleIR(dir: string): LifecycleIR {
-  const gens = readTraceFiles(dir).map(({ gen, events }) => collapseGen(gen, events));
+  const gens = genSummaries(dir);
   const { states, transitions } = buildLifecycleStates(gens);
   return {
     schema_version: 1,
     diagram_type: "lifecycle",
     meta: { title: "Skynet Evolve Generations", quality_profile: "standard" },
-    lanes: [{ id: "main", label: "Generations" }],
+    lanes: [
+      { id: "main", label: "Generations" },
+      { id: "events", label: "Interruptions" },
+      { id: "terminal", label: "Outcomes" },
+    ],
     states,
     transitions,
   };
