@@ -3,10 +3,13 @@
   "scripts": {
     "test": "bun test smoke.test.ts",
     "selftest": "bun skynet.ts --selftest",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "bunx tsc --noEmit",
+    "lint": "eslint ."
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@typescript-eslint/parser": "^8.69.0",
+    "eslint": "9"
   },
   "peerDependencies": {
     "typescript": "^5"
