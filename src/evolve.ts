@@ -35,6 +35,18 @@ export function parsePositiveIntegerFlag(flag: string, raw: string | undefined):
   return value;
 }
 
+// shared extractor for value-taking string flags: a bare `--goal`/`--ref` at the end of argv used
+// to silently yield `undefined` — evolve then fell through to pickGoal's paid auto-goal LLM call,
+// and adopt ran `git pull <url> undefined`, misreporting the failure as a merge conflict. Fail
+// fast with a clear error instead.
+export function takeFlagValue(flags: string[], name: string): string | undefined {
+  const i = flags.indexOf(name);
+  if (i < 0) return undefined;
+  const value = flags.splice(i, 2)[1];
+  if (value === undefined) throw new Error(`${name} requires a value`);
+  return value;
+}
+
 export function parseBudgetFlag(flags: string[]): number {
   const bi = flags.indexOf("--budget");
   if (bi < 0) return 0.05;
@@ -48,8 +60,7 @@ export function parseEvolveFlags(argv: string[]) {
   const flags = [...argv];
   const gi = flags.indexOf("--generations");
   const generations = gi >= 0 ? parsePositiveIntegerFlag("--generations", flags.splice(gi, 2)[1]) : 3;
-  const goi = flags.indexOf("--goal");
-  const goal = goi >= 0 ? flags.splice(goi, 2)[1] : undefined;
+  const goal = takeFlagValue(flags, "--goal");
   const mti = flags.indexOf("--max-turns");
   const maxTurns = mti >= 0 ? parsePositiveIntegerFlag("--max-turns", flags.splice(mti, 2)[1]) : 15;
   const budget = parseBudgetFlag(flags);

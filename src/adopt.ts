@@ -1,7 +1,7 @@
 import { sh } from "./shell.ts";
 import { learn } from "./memory.ts";
 import { gate } from "./gate.ts";
-import { prepareChild, promote, parseBudgetFlag } from "./evolve.ts";
+import { prepareChild, promote, parseBudgetFlag, takeFlagValue } from "./evolve.ts";
 import { appendTrace } from "./trace.ts";
 import { maybeStartUi } from "./ui/server.ts";
 
@@ -12,8 +12,7 @@ export function parseAdoptFlags(argv: string[]) {
   if (!url) throw new Error("adopt requires a git-url");
   const noUi = flags.includes("--no-ui");
   if (noUi) flags.splice(flags.indexOf("--no-ui"), 1);
-  const ri = flags.indexOf("--ref");
-  const ref = ri >= 0 ? flags.splice(ri, 2)[1]! : "main";
+  const ref = takeFlagValue(flags, "--ref") ?? "main";
   return { url, ref, budget: parseBudgetFlag(flags), noUi };
 }
 

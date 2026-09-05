@@ -8,7 +8,8 @@ import { parseToolCmd, isBlockedCmd } from "./tools.ts";
 import { agentLoop } from "./agent.ts";
 import { chat } from "./providers/index.ts";
 import { gate, disallowedDiffFiles, diffHasSymlink } from "./gate.ts";
-import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag } from "./evolve.ts";
+import { nextGenDir, evolveCommitMessage, resolveGoal, parseEvolveFlags, parsePositiveIntegerFlag, takeFlagValue } from "./evolve.ts";
+import { parseAdoptFlags } from "./adopt.ts";
 import { appendTrace, readTraceFiles, genSummaries } from "./trace.ts";
 import { buildArchitectureIR, buildLifecycleIR } from "./ui/ir.ts";
 
@@ -50,6 +51,13 @@ function testFlags() {
   assert(f2.generations === 5 && f2.goal === "x y" && f2.maxTurns === 7 && f2.budget === 0.2, "parseEvolveFlags overrides");
   assert(["0", "-1", "nope", "Infinity"].every((n) => { try { parsePositiveIntegerFlag("--max-turns", n); return false; } catch { return true; } }), "numeric flags reject invalid values");
   assert(["0", "-1", "nope"].every((n) => { try { parseEvolveFlags(["--budget", n]); return false; } catch { return true; } }), "--budget rejects invalid values");
+  // a bare `--goal`/`--ref` used to silently yield undefined: evolve fell through to pickGoal's
+  // paid auto-goal LLM call, adopt ran `git pull <url> undefined` and misreported it as a
+  // conflict. takeFlagValue must fail fast with "<name> requires a value" instead.
+  assert(["--goal", "--ref"].every((f) => { try { takeFlagValue([f], f); return false; } catch (e) { return String(e).includes(`${f} requires a value`); } }), "takeFlagValue rejects a missing flag value");
+  assert((() => { try { parseEvolveFlags(["--goal"]); return false; } catch (e) { return String(e).includes("--goal requires a value"); } })(), "parseEvolveFlags throws on bare --goal");
+  assert((() => { try { parseAdoptFlags(["u", "--ref"]); return false; } catch (e) { return String(e).includes("--ref requires a value"); } })(), "parseAdoptFlags throws on bare --ref");
+  assert(takeFlagValue(["--goal", "x"], "--goal") === "x" && takeFlagValue([], "--goal") === undefined, "takeFlagValue passthrough and absent cases");
 }
 
 async function testEvolve(scratch: string) {
